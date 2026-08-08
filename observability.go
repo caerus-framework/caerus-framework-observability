@@ -590,7 +590,7 @@ func (mc *metricsCollector) Collect(ch chan<- prometheus.Metric) {
 		for _, name := range labelNames {
 			labelValues = append(labelValues, m.Labels[name])
 		}
-		desc := prometheus.NewDesc("caerus_"+m.Name, m.Help, labelNames, nil)
+		desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
 		vt := prometheus.GaugeValue
 		if m.Type == MetricTypeCounter {
 			vt = prometheus.CounterValue

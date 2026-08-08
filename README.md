@@ -27,7 +27,7 @@ Exposes:
 |---|---|---|
 | `/healthz`, `/livez` | liveness | `200 ok` while the process is alive; component health is deliberately excluded (a dependency outage should make a pod unready, not restartable). |
 | `/readyz` | readiness (and startup) | `200 ok` when every registered `HealthProvider` component is healthy, `503` otherwise, with one `fail: <component>: <reason>` line per failing check. |
-| `/metrics` | scrape | Prometheus text format: Go runtime + process metrics and one `caerus_<name>` sample per `MetricsProvider` component that has something to report. |
+| `/metrics` | scrape | Prometheus text format: Go runtime + process metrics and one `<name>` sample per `MetricsProvider` component that has something to report. |
 
 Kubernetes only inspects the status code: `2xx` = healthy, anything else =
 unhealthy. Configure the probes in the pod spec, e.g.:
@@ -82,7 +82,7 @@ so the values are always live:
 // Metrics implements cf.MetricsProvider.
 func (l *Logs) Metrics() []cf.Metric {
     return []cf.Metric{{
-        Name:  "logs_info", // served as caerus_logs_info
+        Name:  "logs_info", // served as logs_info
         Value: 1,
         Labels: map[string]string{"format": l.format.String(), "level": l.Level().String()},
     }}
