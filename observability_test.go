@@ -331,7 +331,7 @@ func TestMetricsEndpointLazyPickup(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("/metrics = %d, want 200", code)
 	}
-	if strings.Contains(body, "caerus_app_info") {
+	if strings.Contains(body, "app_info") {
 		t.Fatal("not-yet-initialized provider must be skipped")
 	}
 	if !strings.Contains(body, "go_goroutines") {
@@ -344,7 +344,7 @@ func TestMetricsEndpointLazyPickup(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("/metrics after pickup = %d, want 200", code)
 	}
-	if !strings.Contains(body, `caerus_app_info{mode="prod"} 1`) {
+	if !strings.Contains(body, `app_info{mode="prod"} 1`) {
 		t.Fatalf("/metrics after pickup body missing the app_info sample:\n%s", body)
 	}
 }
@@ -383,16 +383,16 @@ func TestMetricsCounterTypeScrapedAsCounter(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("/metrics = %d, want 200", code)
 	}
-	if !strings.Contains(body, `caerus_app_info{mode="prod"} 1`) {
+	if !strings.Contains(body, `app_info{mode="prod"} 1`) {
 		t.Fatalf("/metrics missing gauge sample:\n%s", body)
 	}
-	if !strings.Contains(body, `caerus_app_events_total{kind="request"} 42`) {
+	if !strings.Contains(body, `app_events_total{kind="request"} 42`) {
 		t.Fatalf("/metrics missing counter sample:\n%s", body)
 	}
-	if !strings.Contains(body, "# TYPE caerus_app_events_total counter") {
+	if !strings.Contains(body, "# TYPE app_events_total counter") {
 		t.Fatalf("/metrics counter not declared as TYPE counter:\n%s", body)
 	}
-	if !strings.Contains(body, "# TYPE caerus_app_info gauge") {
+	if !strings.Contains(body, "# TYPE app_info gauge") {
 		t.Fatalf("/metrics gauge not declared as TYPE gauge:\n%s", body)
 	}
 }

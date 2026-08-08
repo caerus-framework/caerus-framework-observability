@@ -27,11 +27,11 @@ const (
 )
 
 // Metric is one runtime-state sample a component exposes for the /metrics
-// endpoint. The observability component serves the sample prefixed with
-// "caerus_" (Name "logs_info" becomes "caerus_logs_info").
+// endpoint. The observability component serves the sample under Name as-is
+// (Name "logs_info" appears in /metrics as "logs_info").
 type Metric struct {
-	// Name is the metric name without the "caerus_" prefix. It must not be
-	// empty for the sample to be emitted.
+	// Name is the metric name served on /metrics. It must not be empty for
+	// the sample to be emitted.
 	Name string
 	// Help describes the metric for /metrics consumers.
 	Help string
@@ -109,7 +109,7 @@ func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		for _, name := range labelNames {
 			labelValues = append(labelValues, m.Labels[name])
 		}
-		desc := prometheus.NewDesc("caerus_"+m.Name, m.Help, labelNames, nil)
+		desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
 		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, m.Value, labelValues...)
 	}
 }
@@ -145,7 +145,7 @@ func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, name := range labelNames {
 		labelValues = append(labelValues, m.Labels[name])
 	}
-	desc := prometheus.NewDesc("caerus_"+m.Name, m.Help, labelNames, nil)
+	desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
 	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, m.Value, labelValues...)
 }
 
