@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/caerus-framework/caerus-framework v0.0.5
 	github.com/caerus-framework/caerus-framework-configuration v0.0.2
-	github.com/caerus-framework/caerus-framework-logs v0.0.1
+	github.com/caerus-framework/caerus-framework-logs v0.0.2
 	github.com/prometheus/client_golang v1.24.1
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
