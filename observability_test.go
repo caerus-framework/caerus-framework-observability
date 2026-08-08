@@ -29,9 +29,6 @@ func addComponent(t *testing.T, fw *cf.CaerusFramework, c cf.CaerusComponent) {
 func newTestFW(t *testing.T, comps ...cf.CaerusComponent) *cf.CaerusFramework {
 	t.Helper()
 	fw := cf.New()
-	if err := fw.RegisterStage(testStage); err != nil {
-		t.Fatalf("RegisterStage: %v", err)
-	}
 	addComponent(t, fw, cf_logs.New(cf_logs.WithWriter(io.Discard)))
 	for _, c := range comps {
 		addComponent(t, fw, c)
@@ -115,13 +112,13 @@ func (m *testMetricsProvider) setReady(ready bool) {
 	m.ready = ready
 }
 
-func (m *testMetricsProvider) Metrics() []cf.Metric {
+func (m *testMetricsProvider) Metrics() []Metric {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.ready {
 		return nil
 	}
-	return []cf.Metric{{
+	return []Metric{{
 		Name:   "app_info",
 		Help:   "Test application state.",
 		Value:  1,
@@ -148,9 +145,9 @@ func TestComponentContract(t *testing.T) {
 }
 
 func TestConfigOverlay(t *testing.T) {
-	// defaults: everything enabled, :8080, 2s, service caerus
+	// defaults: health + metrics enabled, tracing off, :9090, 2s, service caerus
 	d := New()
-	if !d.healthChecks || !d.metrics || !d.tracing || d.bindAddress != ":8080" ||
+	if !d.healthChecks || !d.metrics || d.tracing || d.bindAddress != ":9090" ||
 		d.healthCheckTimeout != 2*time.Second || d.serviceName != "caerus" || d.traceEndpoint != "" {
 		t.Fatalf("defaults = health:%v metrics:%v tracing:%v %q %v service:%q endpoint:%q",
 			d.healthChecks, d.metrics, d.tracing, d.bindAddress, d.healthCheckTimeout, d.serviceName, d.traceEndpoint)
@@ -352,6 +349,54 @@ func TestMetricsEndpointLazyPickup(t *testing.T) {
 	}
 }
 
+// testCounterProvider emits both gauge and counter metrics.
+type testCounterProvider struct {
+	*plainComp
+}
+
+func (m *testCounterProvider) Metrics() []Metric {
+	return []Metric{
+		{
+			Name:   "app_info",
+			Help:   "App state.",
+			Value:  1,
+			Labels: map[string]string{"mode": "prod"},
+		},
+		{
+			Name:   "app_events_total",
+			Help:   "Total events processed.",
+			Value:  42,
+			Labels: map[string]string{"kind": "request"},
+			Type:   MetricTypeCounter,
+		},
+	}
+}
+
+func TestMetricsCounterTypeScrapedAsCounter(t *testing.T) {
+	o := New(WithAddress("127.0.0.1:0"))
+	cp := &testCounterProvider{plainComp: &plainComp{name: "app"}}
+	fw := newTestFW(t, o, cp)
+	initFW(t, fw)
+
+	base := "http://" + o.Address()
+	code, body := get(t, base+"/metrics")
+	if code != http.StatusOK {
+		t.Fatalf("/metrics = %d, want 200", code)
+	}
+	if !strings.Contains(body, `caerus_app_info{mode="prod"} 1`) {
+		t.Fatalf("/metrics missing gauge sample:\n%s", body)
+	}
+	if !strings.Contains(body, `caerus_app_events_total{kind="request"} 42`) {
+		t.Fatalf("/metrics missing counter sample:\n%s", body)
+	}
+	if !strings.Contains(body, "# TYPE caerus_app_events_total counter") {
+		t.Fatalf("/metrics counter not declared as TYPE counter:\n%s", body)
+	}
+	if !strings.Contains(body, "# TYPE caerus_app_info gauge") {
+		t.Fatalf("/metrics gauge not declared as TYPE gauge:\n%s", body)
+	}
+}
+
 func TestMetricsDisabled(t *testing.T) {
 	o := New(WithAddress("127.0.0.1:0"), WithMetrics(false))
 	fw := newTestFW(t, o)
@@ -404,13 +449,13 @@ func TestTracingEnabledWithEndpoint(t *testing.T) {
 	prev := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
-	o := New(WithAddress("127.0.0.1:0"), WithTraceEndpoint("127.0.0.1:1"))
+	o := New(WithAddress("127.0.0.1:0"), WithTracing(true), WithTraceEndpoint("127.0.0.1:1"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 
 	tp := o.TracerProvider()
 	if tp == nil {
-		t.Fatal("TracerProvider should be configured when an endpoint is set")
+		t.Fatal("TracerProvider should be configured when tracing is enabled and an endpoint is set")
 	}
 	if otel.GetTracerProvider() != tp {
 		t.Fatal("observability must install its tracer provider globally")

@@ -1,12 +1,17 @@
 # caerus-framework-observability
 
+[![CI](https://github.com/caerus-framework/caerus-framework-observability/actions/workflows/ci.yml/badge.svg)](https://github.com/caerus-framework/caerus-framework-observability/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/caerus-framework/caerus-framework-observability/graph/badge.svg)](https://codecov.io/gh/caerus-framework/caerus-framework-observability)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+
 Caerus Framework — observability component.
 
 Exposes:
 
 - Kubernetes health-check endpoints aggregating every registered component that
   implements the optional
-  [`caerusframework.HealthProvider`](../caerus-framework/component.go)
+  [`caerusframework.HealthProvider`](https://github.com/caerus-framework/caerus-framework/blob/main/component.go)
   interface. Components that do not implement it are simply not included, so
   supporting health checks is entirely optional.
 - A `/metrics` endpoint (Prometheus text format) with Go runtime metrics plus
@@ -29,11 +34,11 @@ unhealthy. Configure the probes in the pod spec, e.g.:
 
 ```yaml
 livenessProbe:
-  httpGet: { path: /healthz, port: 8080 }
+  httpGet: { path: /healthz, port: 9090 }
   initialDelaySeconds: 3
   periodSeconds: 10
 readinessProbe:
-  httpGet: { path: /readyz, port: 8080 }
+  httpGet: { path: /readyz, port: 9090 }
   initialDelaySeconds: 3
   periodSeconds: 5
 ```
@@ -46,7 +51,7 @@ Point a Prometheus scraper at `/metrics`, and a collector (e.g.
 ```go
 fw := caerusframework.New() // observability is a built-in bootstrap stage
 fw.AddComponent(cf_logs.New(cf_logs.WithWriter(os.Stdout)))
-fw.AddComponent(cf_observability.New()) // health checks + metrics on :8080 by default
+fw.AddComponent(cf_observability.New()) // health checks + metrics on :9090 by default
 // ... register the rest of the components ...
 fw.Run(ctx)
 ```
@@ -106,7 +111,7 @@ observability:
   health_checks: true          # enable the health-check endpoints
   metrics: true                # enable the /metrics endpoint
   tracing: true                # enable OTLP trace export (needs trace_endpoint)
-  address: ":8080"             # bind address of the HTTP server
+  address: ":9090"             # bind address of the HTTP server
   health_check_timeout_sec: 2  # per-component health check deadline
   trace_endpoint: "otel-collector:4317"
   service_name: myapp          # service.name on exported spans
@@ -116,12 +121,13 @@ observability:
 |---|---|---|
 | `WithHealthChecks(bool)` | `true` | Enable the Kubernetes health-check endpoints. |
 | `WithMetrics(bool)` | `true` | Enable the `/metrics` endpoint. |
-| `WithTracing(bool)` | `true` | Enable trace export (active once an endpoint is set). |
-| `WithAddress(string)` | `":8080"` | Bind address of the HTTP server. |
+| `WithTracing(bool)` | `false` | Enable trace export (active once an endpoint is set). |
+| `WithAddress(string)` | `":9090"` | Bind address of the HTTP server. |
 | `WithHealthCheckTimeout(d)` | `2s` | Deadline for each component health check. |
 | `WithTraceEndpoint(string)` | `""` (tracing latent) | OTLP/gRPC collector endpoint. |
 | `WithServiceName(string)` | `"caerus"` | `service.name` attribute on exported spans. |
 | `WithConfig(ObservabilityConfig)` | — | Loaded config; non-zero fields override the options. |
+| `WithConfigSource(string)` | `""` | Bind a configuration source; `Init` applies its current value and `OnConfigReload` applies later changes live (tracing) or logs restart-required (bind/metrics/health toggles). |
 | `WithLogger(*slog.Logger)` | framework `logs` logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` | Explicit logger override. |
 
 `health_checks`, `metrics` and `tracing` are `*bool` in `ObservabilityConfig`
@@ -150,9 +156,10 @@ Implements `caerusframework.CaerusComponent`:
 
 ## Docs
 
-- [ARCHITECTURE.md](../caerus-framework/docs/ARCHITECTURE.md) — component model
-  and stage ordering.
-- [LIFECYCLE.md](../caerus-framework/docs/LIFECYCLE.md) — lifecycle guarantees.
+- [ARCHITECTURE.md](https://github.com/caerus-framework/caerus-framework/blob/main/docs/ARCHITECTURE.md)
+  — component model and stage ordering.
+- [LIFECYCLE.md](https://github.com/caerus-framework/caerus-framework/blob/main/docs/LIFECYCLE.md)
+  — lifecycle guarantees.
 
 ## License
 

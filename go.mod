@@ -3,8 +3,9 @@ module github.com/caerus-framework/caerus-framework-observability
 go 1.26
 
 require (
-	github.com/caerus-framework/caerus-framework v0.0.0
-	github.com/caerus-framework/caerus-framework-logs v0.0.0
+	github.com/caerus-framework/caerus-framework v0.0.5
+	github.com/caerus-framework/caerus-framework-configuration v0.0.2
+	github.com/caerus-framework/caerus-framework-logs v0.0.1
 	github.com/prometheus/client_golang v1.24.1
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
@@ -16,6 +17,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -35,8 +37,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/grpc v1.83.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/caerus-framework/caerus-framework => ../caerus-framework
-
-replace github.com/caerus-framework/caerus-framework-logs => ../caerus-framework-logs

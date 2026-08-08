@@ -12,6 +12,7 @@ import (
 	"time"
 
 	cf "github.com/caerus-framework/caerus-framework"
+	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -41,11 +42,11 @@ type ObservabilityConfig struct {
 	// Metrics enables the /metrics endpoint (Prometheus text format; default
 	// enabled). It is a *bool so an explicit metrics: false is honored.
 	Metrics *bool `json:"metrics,omitempty" yaml:"metrics,omitempty"`
-	// Tracing enables OpenTelemetry trace export over OTLP/gRPC (default
-	// enabled, but only active when TraceEndpoint is set). It is a *bool so an
+	// Tracing enables OpenTelemetry trace export over OTLP/gRPC (default off;
+	// internal tracing mechanics stay dark until enabled). It is a *bool so an
 	// explicit tracing: false is honored.
 	Tracing *bool `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	// Address is the bind address for the HTTP server (default ":8080").
+	// Address is the bind address for the HTTP server (default ":9090").
 	Address string `json:"address,omitempty" yaml:"address,omitempty"`
 	// HealthCheckTimeoutSec bounds each component health check (default 2).
 	HealthCheckTimeoutSec int `json:"health_check_timeout_sec,omitempty" yaml:"health_check_timeout_sec,omitempty"`
@@ -70,6 +71,7 @@ type options struct {
 	traceEndpoint      string
 	serviceName        string
 	loaded             *ObservabilityConfig // set by WithConfig; overrides option-set defaults
+	configSource       string               // configuration source for OnConfigReload ("" = none)
 	logger             *slog.Logger
 	loggerSet          bool // true when WithLogger was called explicitly
 }
@@ -85,14 +87,14 @@ func WithMetrics(enabled bool) Option {
 	return func(o *options) { o.metrics = enabled }
 }
 
-// WithTracing enables (default) or disables OpenTelemetry trace export. Tracing
-// is only active once an endpoint is set with WithTraceEndpoint (or the loaded
-// config's trace_endpoint).
+// WithTracing enables (default off) OpenTelemetry trace export. Tracing is off
+// by default and only active once enabled and an endpoint is set with
+// WithTraceEndpoint (or the loaded config's trace_endpoint).
 func WithTracing(enabled bool) Option {
 	return func(o *options) { o.tracing = enabled }
 }
 
-// WithAddress sets the bind address for the HTTP server (default ":8080").
+// WithAddress sets the bind address for the HTTP server (default ":9090").
 func WithAddress(addr string) Option {
 	return func(o *options) { o.address = addr }
 }
@@ -119,9 +121,23 @@ func WithServiceName(name string) Option {
 // Non-zero fields of cfg override the values set by the convenience options,
 // which act as in-code defaults:
 //
-//	o := cf_observability.New(cf_observability.WithConfig(cf_configuration.MustGet[cf_observability.ObservabilityConfig](fw)))
+//	cfg, _ := cf_configuration.Lookup[cf_observability.ObservabilityConfig](conf, "observability")
+//	o := cf_observability.New(cf_observability.WithConfig(*cfg))
 func WithConfig(cfg ObservabilityConfig) Option {
 	return func(o *options) { o.loaded = &cfg }
+}
+
+// WithConfigSource names the configuration source (caerus-framework-
+// configuration) whose ObservabilityConfig is applied to the component at Init
+// and again on every validated reload via OnConfigReload. Prefer this over a
+// WithConfig snapshot when the component is framework-managed: the source stays
+// the live options plane. The component self-registers the source during argv
+// absorption (default file config/<name>.json, owner cf_observability); an argv
+// --<name> file-path override wins, and the app may also register its own
+// Source[ObservabilityConfig] for a custom default. Until the source loads,
+// construction-time defaults apply.
+func WithConfigSource(name string) Option {
+	return func(o *options) { o.configSource = name }
 }
 
 // WithLogger overrides the logger used for component diagnostics. By default
@@ -190,6 +206,7 @@ type Observability struct {
 	serviceName        string
 	tp                 *trace.TracerProvider
 	bindAddress        string
+	configSource       string
 	providers          []namedHealth
 	server             *http.Server
 	addr               string
@@ -201,16 +218,16 @@ type namedHealth struct {
 	comp cf.HealthProvider
 }
 
-// New creates an observability component. Health checks, metrics and tracing
-// are enabled by default; tracing activates only once an endpoint is
-// configured. The HTTP server binds at Init, only when at least one of health
+// New creates an observability component. Health checks and metrics are on by
+// default; tracing is off until explicitly enabled with a config value or
+// option. The HTTP server binds at Init, only when at least one of health
 // checks or metrics is enabled.
 func New(opts ...Option) *Observability {
 	o := options{
 		healthChecks:       true,
 		metrics:            true,
-		tracing:            true,
-		address:            ":8080",
+		tracing:            false,
+		address:            ":9090",
 		healthCheckTimeout: 2 * time.Second,
 		serviceName:        "caerus",
 		logger:             slog.Default(),
@@ -229,6 +246,7 @@ func New(opts ...Option) *Observability {
 		traceEndpoint:      o.traceEndpoint,
 		serviceName:        o.serviceName,
 		bindAddress:        o.address,
+		configSource:       o.configSource,
 		logger:             o.logger,
 		loggerSet:          o.loggerSet,
 	}
@@ -242,9 +260,14 @@ func (c *Observability) Name() string { return ComponentName }
 func (c *Observability) GetInitOrderStage() cf.Stage { return cf.ObservabilityStage }
 
 // GetDependencies implements cf.Dependencies. The component logs through the
-// framework logs component.
+// framework logs component, and depends on configuration when WithConfigSource
+// is set (it reads its own source through the configuration component).
 func (c *Observability) GetDependencies() []string {
-	return []string{cf_logs.ComponentName}
+	deps := []string{cf_logs.ComponentName}
+	if c.configSource != "" {
+		deps = append(deps, cf_configuration.ComponentName)
+	}
+	return deps
 }
 
 // Init implements cf.CaerusComponent. It sets up metrics (Prometheus registry
@@ -263,7 +286,18 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 	c.fw = fw
 	if !c.loggerSet {
 		if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
-			c.logsSub = logs.OnReconfigure(func(l *slog.Logger) { c.logger = l })
+			c.logsSub = logs.OnReconfigureFor(c.Name(), func(l *slog.Logger) { c.logger = l })
+		}
+	}
+
+	// Apply the observability source's current value (loaded before Init, since
+	// configuration initializes in an earlier bootstrap stage). Later reloads
+	// arrive via OnConfigReload.
+	if c.configSource != "" {
+		if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
+			if cfg, err := cf_configuration.Lookup[ObservabilityConfig](conf, c.configSource); err == nil {
+				c.applyConfigLocked(*cfg)
+			}
 		}
 	}
 
@@ -272,8 +306,18 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 		registry.MustRegister(collectors.NewGoCollector())
 		registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		for _, comp := range fw.Components() {
-			if mp, ok := comp.(cf.MetricsProvider); ok {
+			if mp, ok := comp.(MetricsProvider); ok {
 				registry.MustRegister(&metricsCollector{name: comp.Name(), provider: mp})
+			}
+		}
+		if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
+			registry.MustRegister(&logsMetricsCollector{logs: logs})
+		}
+		if c.configSource != "" {
+			// Configuration metrics are only meaningful when this component is
+			// bound to a source; without one the dependency is not declared.
+			if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
+				registry.MustRegister(&configurationMetricsCollector{conf: conf})
 			}
 		}
 		c.registry = registry
@@ -282,17 +326,8 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 	if c.tracing {
 		if c.traceEndpoint == "" {
 			c.logger.Info("cf_observability: tracing disabled (no trace endpoint configured)")
-		} else {
-			tp, err := newTracerProvider(ctx, c.traceEndpoint, c.serviceName)
-			if err != nil {
-				return err
-			}
-			c.tp = tp
-			otel.SetTracerProvider(tp)
-			c.logger.Info("cf_observability: tracing enabled",
-				"endpoint", c.traceEndpoint,
-				"service", c.serviceName,
-			)
+		} else if err := c.reconcileTracingLocked(); err != nil {
+			return err
 		}
 	}
 
@@ -339,6 +374,112 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 		"providers", len(c.providers),
 	)
 	return nil
+}
+
+// applyConfigLocked overlays a loaded ObservabilityConfig onto the runtime
+// fields. Non-zero fields win; the *bool fields honor an explicit false.
+// Callers must hold c.mu. Endpoint options that need a bound-server rebuild
+// are not applied live; OnConfigReload logs them as restart-required.
+func (c *Observability) applyConfigLocked(cfg ObservabilityConfig) {
+	if cfg.HealthChecks != nil {
+		c.healthChecks = *cfg.HealthChecks
+	}
+	if cfg.Metrics != nil {
+		c.metrics = *cfg.Metrics
+	}
+	if cfg.Tracing != nil {
+		c.tracing = *cfg.Tracing
+	}
+	if cfg.Address != "" {
+		c.bindAddress = cfg.Address
+	}
+	if cfg.HealthCheckTimeoutSec != 0 {
+		c.healthCheckTimeout = time.Duration(cfg.HealthCheckTimeoutSec) * time.Second
+	}
+	if cfg.TraceEndpoint != "" {
+		c.traceEndpoint = cfg.TraceEndpoint
+	}
+	if cfg.ServiceName != "" {
+		c.serviceName = cfg.ServiceName
+	}
+}
+
+// reconcileTracingLocked starts or stops the tracer provider to match the
+// current tracing config. Callers must hold c.mu. A failed provider build
+// returns the error and keeps the previous state (last-good).
+func (c *Observability) reconcileTracingLocked() error {
+	if c.tracing && c.traceEndpoint != "" {
+		if c.tp != nil {
+			return nil
+		}
+		tp, err := newTracerProvider(context.Background(), c.traceEndpoint, c.serviceName)
+		if err != nil {
+			return err
+		}
+		c.tp = tp
+		otel.SetTracerProvider(tp)
+		c.logger.Info("cf_observability: tracing enabled",
+			"endpoint", c.traceEndpoint,
+			"service", c.serviceName,
+		)
+		return nil
+	}
+	if c.tp != nil {
+		old := c.tp
+		c.tp = nil
+		// Reset the global so late otel.Tracer calls do not hit a shut-down
+		// provider; a sampler-only provider drops spans cheaply.
+		otel.SetTracerProvider(trace.NewTracerProvider(trace.WithSampler(trace.NeverSample())))
+		c.logger.Info("cf_observability: tracing disabled")
+		_ = old.Shutdown(context.Background())
+	}
+	return nil
+}
+
+// OnConfigReload implements cf.ConfigReloader. It applies a freshly loaded
+// ObservabilityConfig from the source named by WithConfigSource. Tracing
+// toggle/endpoint changes take effect immediately (provider swap); HTTP
+// endpoint changes (bind address, health-check/metrics toggles) are logged as
+// restart-required and the last-good server keeps running. The initial value
+// delivered by configuration before this component's Init is ignored (Init
+// reads the source itself and must not build providers early).
+func (c *Observability) OnConfigReload(source string, cfg any) {
+	if source != c.configSource {
+		return
+	}
+	oc, ok := cfg.(*ObservabilityConfig)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	if c.fw == nil {
+		// Pre-Init notification from the configuration stage: Init applies the
+		// source value itself. Do not build providers/server yet.
+		c.mu.Unlock()
+		return
+	}
+	prevTracing, prevEndpoint := c.tracing, c.traceEndpoint
+	prevAddr, prevHealth, prevMetrics := c.bindAddress, c.healthChecks, c.metrics
+	c.applyConfigLocked(*oc)
+	tracingChanged := c.tracing != prevTracing || c.traceEndpoint != prevEndpoint
+	var tracingErr error
+	if tracingChanged {
+		tracingErr = c.reconcileTracingLocked()
+	}
+	restart := c.bindAddress != prevAddr || c.healthChecks != prevHealth || c.metrics != prevMetrics
+	newAddr, newHealth, newMetrics := c.bindAddress, c.healthChecks, c.metrics
+	c.mu.Unlock()
+
+	if tracingErr != nil {
+		c.logger.Error("cf_observability: tracing reload rejected; keeping previous provider", "err", tracingErr)
+	}
+	if restart {
+		c.logger.Warn("cf_observability: HTTP endpoint changes need a restart to apply",
+			"address", newAddr,
+			"health_checks", newHealth,
+			"metrics", newMetrics,
+		)
+	}
 }
 
 // Shutdown implements cf.CaerusComponent. It stops the HTTP server (waiting
@@ -422,7 +563,7 @@ func newTracerProvider(ctx context.Context, endpoint, serviceName string) (*trac
 	), nil
 }
 
-// metricsCollector bridges a cf.MetricsProvider into the Prometheus registry.
+// metricsCollector bridges a MetricsProvider into the Prometheus registry.
 // It is an unchecked collector: the metrics and their descriptors are only
 // known at Collect time, so Describe emits nothing (client_golang treats a
 // collector yielding no descriptor as unchecked). On every /metrics scrape it
@@ -430,7 +571,7 @@ func newTracerProvider(ctx context.Context, endpoint, serviceName string) (*trac
 // returns nil and is skipped — a lazy pickup that needs no subscription.
 type metricsCollector struct {
 	name     string
-	provider cf.MetricsProvider
+	provider MetricsProvider
 }
 
 func (mc *metricsCollector) Describe(ch chan<- *prometheus.Desc) {}
@@ -450,7 +591,11 @@ func (mc *metricsCollector) Collect(ch chan<- prometheus.Metric) {
 			labelValues = append(labelValues, m.Labels[name])
 		}
 		desc := prometheus.NewDesc("caerus_"+m.Name, m.Help, labelNames, nil)
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, m.Value, labelValues...)
+		vt := prometheus.GaugeValue
+		if m.Type == MetricTypeCounter {
+			vt = prometheus.CounterValue
+		}
+		ch <- prometheus.MustNewConstMetric(desc, vt, m.Value, labelValues...)
 	}
 }
 
@@ -500,3 +645,4 @@ func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request)
 
 var _ cf.CaerusComponent = (*Observability)(nil)
 var _ cf.Dependencies = (*Observability)(nil)
+var _ cf.ConfigReloader = (*Observability)(nil)
