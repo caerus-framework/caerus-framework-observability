@@ -44,6 +44,34 @@ func initFW(t *testing.T, fw *cf.CaerusFramework) {
 	t.Cleanup(func() { _ = fw.Shutdown(context.Background()) })
 }
 
+// startHTTP runs the observability Runnable until it binds, then cancels it
+// on test cleanup. Call after initFW for tests that GET /metrics or probes.
+func startHTTP(t *testing.T, o *Observability) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- o.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("Run: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if o.Address() != "" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("observability Run did not bind an address")
+}
+
 func get(t *testing.T, url string) (int, string) {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -142,6 +170,7 @@ func TestComponentContract(t *testing.T) {
 	}
 	var _ cf.CaerusComponent = o
 	var _ cf.Dependencies = o
+	var _ cf.Runnable = o
 }
 
 func TestConfigOverlay(t *testing.T) {
@@ -209,6 +238,7 @@ func TestReadinessAggregatesHealthProviders(t *testing.T) {
 	plain := &plainComp{name: "plain"}
 	fw := newTestFW(t, o, ok, bad, plain)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	base := "http://" + o.Address()
 
@@ -253,6 +283,7 @@ func TestReadinessTimesOutSlowProviders(t *testing.T) {
 	slow.mu.Unlock()
 	fw := newTestFW(t, o, slow)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	start := time.Now()
 	code, body := get(t, "http://"+o.Address()+"/readyz")
@@ -273,6 +304,7 @@ func TestShutdownStopsServer(t *testing.T) {
 	o := New(WithAddress("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	base := "http://" + o.Address()
 	if code, _ := get(t, base+"/healthz"); code != http.StatusOK {
@@ -296,12 +328,25 @@ func TestInitTwiceIsIdempotent(t *testing.T) {
 	o := New(WithAddress("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
-	addr := o.Address()
+	if o.Address() != "" {
+		t.Fatal("Init must not bind a listen address")
+	}
 	if err := o.Init(context.Background(), fw); err != nil {
 		t.Fatalf("second Init: %v", err)
 	}
+	if o.Address() != "" {
+		t.Fatal("second Init must not bind a listen address")
+	}
+	startHTTP(t, o)
+	addr := o.Address()
+	if addr == "" {
+		t.Fatal("Run must bind a listen address")
+	}
+	if err := o.Init(context.Background(), fw); err != nil {
+		t.Fatalf("Init after Run: %v", err)
+	}
 	if o.Address() != addr {
-		t.Fatal("second Init must not rebind the server")
+		t.Fatal("Init after Run must not rebind the server")
 	}
 }
 
@@ -311,6 +356,7 @@ func TestLivenessDoesNotFailOnComponentHealth(t *testing.T) {
 	bad.setErr(errors.New("down"))
 	fw := newTestFW(t, o, bad)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	code, body := get(t, "http://"+o.Address()+"/healthz")
 	if code != http.StatusOK || !strings.Contains(body, "ok") {
@@ -323,6 +369,7 @@ func TestMetricsEndpointLazyPickup(t *testing.T) {
 	mp := &testMetricsProvider{plainComp: &plainComp{name: "app"}}
 	fw := newTestFW(t, o, mp)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	base := "http://" + o.Address()
 
@@ -377,6 +424,7 @@ func TestMetricsCounterTypeScrapedAsCounter(t *testing.T) {
 	cp := &testCounterProvider{plainComp: &plainComp{name: "app"}}
 	fw := newTestFW(t, o, cp)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	base := "http://" + o.Address()
 	code, body := get(t, base+"/metrics")
@@ -401,6 +449,7 @@ func TestMetricsDisabled(t *testing.T) {
 	o := New(WithAddress("127.0.0.1:0"), WithMetrics(false))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	if code, _ := get(t, "http://"+o.Address()+"/metrics"); code != http.StatusNotFound {
 		t.Fatalf("/metrics with metrics disabled = %d, want 404", code)
@@ -414,6 +463,7 @@ func TestMetricsServedWithoutHealthChecks(t *testing.T) {
 	o := New(WithAddress("127.0.0.1:0"), WithHealthChecks(false))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
+	startHTTP(t, o)
 
 	if o.Address() == "" {
 		t.Fatal("server should still bind for /metrics when health checks are off")
@@ -459,5 +509,50 @@ func TestTracingEnabledWithEndpoint(t *testing.T) {
 	}
 	if otel.GetTracerProvider() != tp {
 		t.Fatal("observability must install its tracer provider globally")
+	}
+}
+
+func TestInitDoesNotListen(t *testing.T) {
+	o := New(WithAddress("127.0.0.1:0"))
+	fw := newTestFW(t, o)
+	initFW(t, fw)
+	if addr := o.Address(); addr != "" {
+		t.Fatalf("Init bound %q; listen belongs in Run", addr)
+	}
+}
+
+func TestRunBeforeInit(t *testing.T) {
+	o := New(WithAddress("127.0.0.1:0"))
+	err := o.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Run before Init") {
+		t.Fatalf("Run before Init = %v, want Run before Init", err)
+	}
+}
+
+// jobTarget is a one-shot JobRunner used to prove the job path Inits
+// observability (bootstrap stage) but never starts its Runnable.
+type jobTarget struct {
+	*plainComp
+	obs  *Observability
+	addr string
+}
+
+func (j *jobTarget) RunJob(context.Context, string) error {
+	j.addr = j.obs.Address()
+	return nil
+}
+
+func TestJobPathDoesNotListen(t *testing.T) {
+	o := New(WithAddress("127.0.0.1:0"))
+	target := &jobTarget{plainComp: &plainComp{name: "migrator"}, obs: o}
+	fw := newTestFW(t, o, target)
+	if err := fw.RunJob(context.Background(), "migrator", "migrate"); err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	if target.addr != "" {
+		t.Fatalf("job path bound observability at %q; jobs must not start Runnables", target.addr)
+	}
+	if o.Address() != "" {
+		t.Fatalf("observability still bound %q after job Shutdown", o.Address())
 	}
 }

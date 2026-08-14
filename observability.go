@@ -208,9 +208,16 @@ type Observability struct {
 	bindAddress        string
 	configSource       string
 	providers          []namedHealth
+	handler            http.Handler
+	initialized        bool
+	running            bool
 	server             *http.Server
 	addr               string
 }
+
+// httpDrainTimeout is how long Run waits for in-flight probe/scrape requests
+// when the framework cancels the run context.
+const httpDrainTimeout = 5 * time.Second
 
 // namedHealth pairs a component's name with its HealthProvider.
 type namedHealth struct {
@@ -220,8 +227,10 @@ type namedHealth struct {
 
 // New creates an observability component. Health checks and metrics are on by
 // default; tracing is off until explicitly enabled with a config value or
-// option. The HTTP server binds at Init, only when at least one of health
-// checks or metrics is enabled.
+// option. Init prepares collectors and the HTTP mux; Run (cf.Runnable) binds
+// the listener when at least one of health checks or metrics is enabled.
+// Jobs never start Runnables, so a migrate/seed process does not open the
+// operator HTTP port.
 func New(opts ...Option) *Observability {
 	o := options{
 		healthChecks:       true,
@@ -274,14 +283,18 @@ func (c *Observability) GetDependencies() []string {
 // with Go runtime collectors and one collector per registered component
 // implementing cf.MetricsProvider) and tracing (OTLP tracer provider, when an
 // endpoint is configured and tracing is enabled). When health checks or
-// metrics are enabled it binds the HTTP server (fail-fast on an unusable
-// address) and discovers the registered components implementing
-// cf.HealthProvider.
+// metrics are enabled it builds the HTTP mux and discovers registered
+// cf.HealthProvider components. It does not bind a listen address — that is
+// Run's job, so a framework job (which never starts Runnables) does not
+// expose /metrics or probes.
 func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.server != nil || c.tp != nil {
-		return nil // already initialized
+	if c.initialized {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	c.fw = fw
 	if !c.loggerSet {
@@ -333,6 +346,7 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 
 	if !c.healthChecks && !c.metrics {
 		c.logger.Info("cf_observability: endpoints disabled")
+		c.initialized = true
 		return nil
 	}
 
@@ -350,30 +364,104 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 	if c.metrics {
 		mux.Handle("/metrics", promhttp.HandlerFor(c.registry, promhttp.HandlerOpts{}))
 	}
-
-	ln, err := net.Listen("tcp", c.bindAddress)
-	if err != nil {
-		return fmt.Errorf("cf_observability: listen %s: %w", c.bindAddress, err)
-	}
-	c.addr = ln.Addr().String()
-	server := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	c.server = server
-	logger := c.logger
-	go func(s *http.Server) {
-		if err := s.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("cf_observability: HTTP server", "err", err)
-		}
-	}(server)
-	c.logger.Info("cf_observability: HTTP server listening",
-		"addr", c.addr,
+	c.handler = mux
+	c.initialized = true
+	c.logger.Info("cf_observability: initialized",
 		"health_checks", c.healthChecks,
 		"metrics", c.metrics,
 		"providers", len(c.providers),
+		"bind_address", c.bindAddress,
 	)
 	return nil
+}
+
+// Run implements cf.Runnable. It binds the operator HTTP server (health
+// probes and /metrics) and serves until ctx is canceled. Init only prepares
+// the mux; claiming a listen address here means a job-only process — which
+// never starts Runnables — does not expose those endpoints.
+func (c *Observability) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	if !c.initialized {
+		c.mu.Unlock()
+		return errors.New("cf_observability: Run before Init")
+	}
+	if c.running {
+		c.mu.Unlock()
+		return errors.New("cf_observability: Run already active")
+	}
+	if c.handler == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	handler := c.handler
+	bindAddress := c.bindAddress
+	c.running = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.running = false
+		c.addr = ""
+		c.server = nil
+		c.mu.Unlock()
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", bindAddress)
+	if err != nil {
+		return fmt.Errorf("cf_observability: listen %s: %w", bindAddress, err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	c.mu.Lock()
+	c.server = server
+	c.addr = ln.Addr().String()
+	addr := c.addr
+	providers := len(c.providers)
+	healthChecks := c.healthChecks
+	metrics := c.metrics
+	c.mu.Unlock()
+	c.logger.Info("cf_observability: HTTP server listening",
+		"addr", addr,
+		"health_checks", healthChecks,
+		"metrics", metrics,
+		"providers", providers,
+	)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Serve(ln) }()
+
+	select {
+	case err := <-errCh:
+		return normalizeHTTPServerError(err)
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpDrainTimeout)
+		shutdownErr := server.Shutdown(shutdownCtx)
+		serveErr := normalizeHTTPServerError(<-errCh)
+		cancel()
+		if shutdownErr != nil {
+			c.logger.Error("cf_observability: graceful shutdown failed", "err", shutdownErr)
+			return shutdownErr
+		}
+		return serveErr
+	}
+}
+
+func normalizeHTTPServerError(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 // applyConfigLocked overlays a loaded ObservabilityConfig onto the runtime
@@ -482,9 +570,10 @@ func (c *Observability) OnConfigReload(source string, cfg any) {
 	}
 }
 
-// Shutdown implements cf.CaerusComponent. It stops the HTTP server (waiting
-// for in-flight requests up to ctx) and flushes the tracer provider. Safe to
-// call even if Init never ran or the features are disabled.
+// Shutdown implements cf.CaerusComponent. It stops the HTTP server if Run
+// (or an in-flight serve) left one running, waiting for in-flight requests up
+// to ctx, and flushes the tracer provider. Safe to call even if Init never
+// ran or the features are disabled.
 func (c *Observability) Shutdown(ctx context.Context) error {
 	c.mu.Lock()
 	if c.logsSub != nil {
@@ -493,6 +582,11 @@ func (c *Observability) Shutdown(ctx context.Context) error {
 	}
 	server := c.server
 	c.server = nil
+	c.addr = ""
+	c.handler = nil
+	c.providers = nil
+	c.initialized = false
+	c.fw = nil
 	tp := c.tp
 	c.tp = nil
 	c.mu.Unlock()
@@ -519,8 +613,9 @@ func (c *Observability) Shutdown(ctx context.Context) error {
 }
 
 // Address returns the bound address of the HTTP server, or "" if neither
-// health checks nor metrics are enabled or Init has not run. It is useful for
-// building Kubernetes probe configs at runtime.
+// health checks nor metrics are enabled, Init has not run, or Run has not
+// bound yet. It is useful for building Kubernetes probe configs at runtime
+// after the serve path has started.
 func (c *Observability) Address() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -646,3 +741,4 @@ func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request)
 var _ cf.CaerusComponent = (*Observability)(nil)
 var _ cf.Dependencies = (*Observability)(nil)
 var _ cf.ConfigReloader = (*Observability)(nil)
+var _ cf.Runnable = (*Observability)(nil)

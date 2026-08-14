@@ -46,15 +46,68 @@ readinessProbe:
 Point a Prometheus scraper at `/metrics`, and a collector (e.g.
 `otel-collector`) at the configured `trace_endpoint` for OTLP/gRPC spans.
 
-## Usage
+## Wiring
+
+Observability is **always-on core**, not a chassis component you list next to
+postgres. `cf.New(&cf.FrameworkOptions{Observability: …})` registers it.
+`RunWithSignals` (the serve path) starts its `Runnable`, which is when the
+process binds the operator HTTP port.
+
+### Golden path (app `main`)
 
 ```go
-fw := caerusframework.New() // observability is a built-in bootstrap stage
+fw := cf.New(&cf.FrameworkOptions{
+	Logs: &cf.LogsSettings{
+		Format: "json", Level: "info", ConfigSource: "logs",
+	},
+	Observability: &cf.ObservabilitySettings{
+		Address:      ":9090", // /livez, /readyz, /metrics — bound in Run
+		ConfigSource: "observability",
+	},
+	Components: []cf.CaerusComponent{
+		// postgres, valkey, app, …
+	},
+})
+if err := fw.RunWithSignals(ctx, cf.WithShutdownTimeout(15*time.Second)); err != nil {
+	log.Fatal(err)
+}
+```
+
+The seed’s `ConfigSource` is the configuration **source** name (file path
+flag `--observability` when it is `"observability"`). The component
+`Name()` is also `"observability"`. Prefer matching those two strings so
+`GetDependencies` and the `--<name>` flag are the same word.
+
+### Simple path (tests / one-off binary)
+
+```go
+fw := caerusframework.New() // no FrameworkOptions: add core by hand
 fw.AddComponent(cf_logs.New(cf_logs.WithWriter(os.Stdout)))
-fw.AddComponent(cf_observability.New()) // health checks + metrics on :9090 by default
+fw.AddComponent(cf_observability.New()) // health + metrics, bind :9090 in Run
 // ... register the rest of the components ...
 fw.Run(ctx)
 ```
+
+### Serving vs jobs
+
+This component is the process’s **operator shop window** (`/livez`, `/readyz`,
+`/metrics`). It is not the public API server (`caerus-framework-http` is).
+
+`Init` prepares collectors, the mux, and the tracer. `Run` is the only place
+that calls `net.Listen`. Framework jobs (`--postgresql.job=migrate`,
+`fw.RunJob`, app ops jobs) initialize bootstrap stages — including this
+component — and **never start `Runnable`s**. A migrate Job therefore does not
+open `:9090`.
+
+```text
+Wrong: Init opens :9090 because “health must exist before Run.”
+Right: Init prepares; Run binds. Jobs skip Runnables, so one-shot work has
+       no operator HTTP.
+```
+
+Configure Kubernetes probes and Prometheus scrapes on **serving** pods, not
+on Job pods. Unauthenticated `/metrics` on a cluster network is an ops-plane
+problem (NetworkPolicy); this module does not add scrape mTLS.
 
 ### Optional component health checks
 
@@ -136,21 +189,24 @@ of being treated as "unset".
 
 ## Component contract
 
-Implements `caerusframework.CaerusComponent`:
+Implements `caerusframework.CaerusComponent` and `cf.Runnable`:
 
 - `Name()` → `"observability"` (`cf_observability.ComponentName`)
 - `GetInitOrderStage()` → `caerusframework.ObservabilityStage` (third bootstrap
   stage, after logs and configuration)
-- `GetDependencies()` → `[logs]`
+- `GetDependencies()` → `[logs]` (plus `configuration` when `WithConfigSource`
+  is set)
 - `Init` sets up the Prometheus registry (Go/process collectors + one collector
   per registered `MetricsProvider`), builds and installs the tracer provider
-  when tracing is enabled and an endpoint is configured, and binds the HTTP
-  server (fail-fast on an unusable address) when health checks or metrics are
-  enabled. With everything disabled it is a no-op.
-- `Shutdown` stops the server, waiting for in-flight requests up to `ctx`, and
-  flushes the tracer provider.
-- `Address()` returns the bound address (empty when disabled) for building
-  probe configs at runtime.
+  when tracing is enabled and an endpoint is configured, and builds the HTTP
+  mux when health checks or metrics are enabled. It does **not** bind a listen
+  address. With everything disabled it is a no-op besides logger subscribe.
+- `Run` binds the HTTP server (fail-fast on an unusable address) and serves
+  until the framework cancels the run context. Jobs never call `Run`.
+- `Shutdown` stops the server if one is running, waiting for in-flight
+  requests up to `ctx`, and flushes the tracer provider.
+- `Address()` returns the bound address (empty when disabled, before `Run`,
+  or after shutdown) for building probe configs at runtime.
 - `TracerProvider()` returns the configured provider (nil when tracing is
   inactive).
 
