@@ -61,7 +61,7 @@ fw := cf.New(&cf.FrameworkOptions{
 		Format: "json", Level: "info", ConfigSource: "logs",
 	},
 	Observability: &cf.ObservabilitySettings{
-		Address:      ":9090", // /livez, /readyz, /metrics — bound in Run
+		Bind:         ":9090", // /livez, /readyz, /metrics — bound in Run
 		ConfigSource: "observability",
 	},
 	Components: []cf.CaerusComponent{
@@ -95,9 +95,9 @@ This component is the process’s **operator shop window** (`/livez`, `/readyz`,
 
 `Init` prepares collectors, the mux, and the tracer. `Run` is the only place
 that calls `net.Listen`. Framework jobs (`--postgresql.job=migrate`,
-`fw.RunJob`, app ops jobs) initialize bootstrap stages — including this
-component — and **never start `Runnable`s**. A migrate Job therefore does not
-open `:9090`.
+`fw.RunJob`) **never start `Runnable`s**, and observability is **not**
+always initialized on a job (core job Init is logs + configuration). A
+migrate Job therefore does not open `:9090`.
 
 ```text
 Wrong: Init opens :9090 because “health must exist before Run.”
@@ -106,8 +106,62 @@ Right: Init prepares; Run binds. Jobs skip Runnables, so one-shot work has
 ```
 
 Configure Kubernetes probes and Prometheus scrapes on **serving** pods, not
-on Job pods. Unauthenticated `/metrics` on a cluster network is an ops-plane
-problem (NetworkPolicy); this module does not add scrape mTLS.
+on Job pods. `/metrics` has no scrape auth in this module.
+
+### Who may hit `:9090` (NetworkPolicy)
+
+Default `bind` is `:9090` (all interfaces). The shop window is then
+reachable from anything that can route to the pod IP on that port —
+kubelet probes, an in-cluster Prometheus, **and** any other pod unless
+you restrict it. That is an **ops-plane** problem, not something this
+module solves with mTLS.
+
+Path A — Cluster scrape (recommended for serve Deployments):
+
+Keep `bind: ":9090"` so kubelet and Prometheus can reach the pod IP.
+Allow **ingress TCP 9090** only from:
+
+- the nodes / kubelet (liveness and readiness probes), and
+- the namespace (or PodSelector) that runs Prometheus / Grafana Alloy.
+
+Deny 9090 from the public Ingress and from app namespaces that have no
+reason to scrape. Example shape (adjust labels to your cluster):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: observability-shop-window
+spec:
+  podSelector:
+    matchLabels:
+      app: myapp          # serving pods only, not migrate Jobs
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring   # Prometheus / Alloy
+        # kubelet probes often come from the node; some CNIs need:
+        # - ipBlock: { cidr: <node-pod-CIDR or hostNetwork> }
+      ports:
+        - protocol: TCP
+          port: 9090
+```
+
+Path B — Loopback only (laptop / `go run`):
+
+```json
+{ "bind": "127.0.0.1:9090" }
+```
+
+Nothing on the cluster network can scrape or probe that port. Do **not**
+use Path B on a Kubernetes serve pod if you still want `/readyz` and
+`/metrics` from kubelet/Prometheus.
+
+Wrong: all-interfaces bind and no NetworkPolicy, then treating `/metrics`
+as “internal” because the Service is ClusterIP.  
+Right: Path A bind + Policy, or Path B only when the process is local.
 
 ### Optional component health checks
 
@@ -122,7 +176,7 @@ func (c *CFMongoDB) Health(ctx context.Context) error {
 ```
 
 Every check is bounded by the health-check timeout (default `2s`); a component
-that misses its deadline is reported as `timed out` so a hung check can never
+that misses its deadline is reported as `timed_out` so a hung check can never
 hang the probe.
 
 ### Optional component metrics (lazy pickup)
@@ -150,9 +204,17 @@ not implement the interface contribute nothing.
 ### Tracing
 
 With an endpoint configured, `Init` creates an OTLP/gRPC tracer provider
-(`AlwaysSample`, `service.name` = `WithServiceName`) and installs it as the
-global provider; components trace through `otel.Tracer`. `Shutdown` flushes
-pending spans. The transport is insecure — run the collector in-cluster.
+and installs it as the global provider; components trace through
+`otel.Tracer`. `Shutdown` flushes pending spans. OTLP uses **TLS** by
+default. Set `trace_insecure: true` only when the collector has no TLS
+(you are admitting cleartext).
+
+**Sampling:** head sampling in this process. Default `trace_sample_ratio`
+is **1.0** (every new trace is kept; same volume as the old AlwaysSample).
+Set `0.1` to keep about 10% of new traces. Children follow the parent
+(`ParentBased`): if the incoming trace was sampled, this process still
+records the child. `0` means new traces are not sampled. This is not
+TLS (`trace_insecure`) and not `/metrics`.
 
 ## Configuration
 
@@ -164,9 +226,11 @@ observability:
   health_checks: true          # enable the health-check endpoints
   metrics: true                # enable the /metrics endpoint
   tracing: true                # enable OTLP trace export (needs trace_endpoint)
-  address: ":9090"             # bind address of the HTTP server
+  bind: ":9090"                # string = one listener; array = multibind
   health_check_timeout_sec: 2  # per-component health check deadline
   trace_endpoint: "otel-collector:4317"
+  trace_insecure: false        # default TLS; set true to admit cleartext OTLP
+  trace_sample_ratio: 1.0      # 1 = all new traces; 0.1 ≈ 10%; children follow parent
   service_name: myapp          # service.name on exported spans
 ```
 
@@ -175,9 +239,11 @@ observability:
 | `WithHealthChecks(bool)` | `true` | Enable the Kubernetes health-check endpoints. |
 | `WithMetrics(bool)` | `true` | Enable the `/metrics` endpoint. |
 | `WithTracing(bool)` | `false` | Enable trace export (active once an endpoint is set). |
-| `WithAddress(string)` | `":9090"` | Bind address of the HTTP server. |
+| `WithBind(...string)` | `":9090"` | Listen address(es); one string or several `host:port`. |
 | `WithHealthCheckTimeout(d)` | `2s` | Deadline for each component health check. |
 | `WithTraceEndpoint(string)` | `""` (tracing latent) | OTLP/gRPC collector endpoint. |
+| `WithTraceInsecure(bool)` | `false` (TLS) | Admit cleartext OTLP. |
+| `WithTraceSampleRatio(float64)` | `1.0` | Head sampling 0–1 (`ParentBased` + ratio). |
 | `WithServiceName(string)` | `"caerus"` | `service.name` attribute on exported spans. |
 | `WithConfig(ObservabilityConfig)` | — | Loaded config; non-zero fields override the options. |
 | `WithConfigSource(string)` | `""` | Bind a configuration source; `Init` applies its current value and `OnConfigReload` applies later changes live (tracing) or logs restart-required (bind/metrics/health toggles). |

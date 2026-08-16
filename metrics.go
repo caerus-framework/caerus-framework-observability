@@ -1,6 +1,7 @@
 package cf_observability
 
 import (
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,6 +74,7 @@ type logsMetricsCollector struct {
 func (c *logsMetricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
+	defer recoverCollect("logs")
 	ms := []Metric{{
 		Name:  "logs_info",
 		Help:  "Current logging configuration.",
@@ -97,20 +99,7 @@ func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		})
 	}
 	for _, m := range ms {
-		if m.Name == "" {
-			continue
-		}
-		labelNames := make([]string, 0, len(m.Labels))
-		for name := range m.Labels {
-			labelNames = append(labelNames, name)
-		}
-		sort.Strings(labelNames)
-		labelValues := make([]string, 0, len(labelNames))
-		for _, name := range labelNames {
-			labelValues = append(labelValues, m.Labels[name])
-		}
-		desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, m.Value, labelValues...)
+		emitMetric(ch, m)
 	}
 }
 
@@ -124,6 +113,7 @@ type configurationMetricsCollector struct {
 func (c *configurationMetricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
+	defer recoverCollect("configuration")
 	sources := c.conf.Sources()
 	if len(sources) == 0 {
 		return
@@ -136,6 +126,14 @@ func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			"sources": strings.Join(sources, ","),
 		},
 	}
+	emitMetric(ch, m)
+}
+
+func emitMetric(ch chan<- prometheus.Metric, m Metric) {
+	if m.Name == "" {
+		return
+	}
+	defer recoverCollect(m.Name)
 	labelNames := make([]string, 0, len(m.Labels))
 	for name := range m.Labels {
 		labelNames = append(labelNames, name)
@@ -146,7 +144,17 @@ func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		labelValues = append(labelValues, m.Labels[name])
 	}
 	desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
-	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, m.Value, labelValues...)
+	vt := prometheus.GaugeValue
+	if m.Type == MetricTypeCounter {
+		vt = prometheus.CounterValue
+	}
+	ch <- prometheus.MustNewConstMetric(desc, vt, m.Value, labelValues...)
+}
+
+func recoverCollect(name string) {
+	if rec := recover(); rec != nil {
+		slog.Error("cf_observability: skipped bad metric sample", "collector", name, "panic", rec)
+	}
 }
 
 var _ cf.CaerusComponent = (*cf_logs.Logs)(nil)
