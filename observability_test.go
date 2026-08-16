@@ -17,7 +17,8 @@ import (
 
 const testStage = cf.Stage("testdata")
 
-func boolPtr(b bool) *bool { return &b }
+func boolPtr(b bool) *bool        { return &b }
+func floatPtr(f float64) *float64 { return &f }
 
 func addComponent(t *testing.T, fw *cf.CaerusFramework, c cf.CaerusComponent) {
 	t.Helper()
@@ -173,23 +174,33 @@ func TestComponentContract(t *testing.T) {
 	var _ cf.Runnable = o
 }
 
+func firstBind(o *Observability) string {
+	if len(o.binds) == 0 {
+		return ""
+	}
+	return o.binds[0]
+}
+
 func TestConfigOverlay(t *testing.T) {
 	// defaults: health + metrics enabled, tracing off, :9090, 2s, service caerus
 	d := New()
-	if !d.healthChecks || !d.metrics || d.tracing || d.bindAddress != ":9090" ||
+	if !d.healthChecks || !d.metrics || d.tracing || firstBind(d) != ":9090" ||
 		d.healthCheckTimeout != 2*time.Second || d.serviceName != "caerus" || d.traceEndpoint != "" {
 		t.Fatalf("defaults = health:%v metrics:%v tracing:%v %q %v service:%q endpoint:%q",
-			d.healthChecks, d.metrics, d.tracing, d.bindAddress, d.healthCheckTimeout, d.serviceName, d.traceEndpoint)
+			d.healthChecks, d.metrics, d.tracing, firstBind(d), d.healthCheckTimeout, d.serviceName, d.traceEndpoint)
+	}
+	if d.sampleRatio != 1 {
+		t.Fatalf("default sample ratio = %v, want 1", d.sampleRatio)
 	}
 
 	// option-driven
 	o := New(WithHealthChecks(false), WithMetrics(false), WithTracing(false),
-		WithAddress("127.0.0.1:9999"), WithHealthCheckTimeout(time.Second),
+		WithBind("127.0.0.1:9999"), WithHealthCheckTimeout(time.Second),
 		WithTraceEndpoint("collector:4317"), WithServiceName("myapp"))
-	if o.healthChecks || o.metrics || o.tracing || o.bindAddress != "127.0.0.1:9999" ||
+	if o.healthChecks || o.metrics || o.tracing || firstBind(o) != "127.0.0.1:9999" ||
 		o.healthCheckTimeout != time.Second || o.traceEndpoint != "collector:4317" || o.serviceName != "myapp" {
 		t.Fatalf("options not applied: health:%v metrics:%v tracing:%v %q %v %q %q",
-			o.healthChecks, o.metrics, o.tracing, o.bindAddress, o.healthCheckTimeout, o.traceEndpoint, o.serviceName)
+			o.healthChecks, o.metrics, o.tracing, firstBind(o), o.healthCheckTimeout, o.traceEndpoint, o.serviceName)
 	}
 
 	// loaded config wins; explicit false values are honored
@@ -197,23 +208,24 @@ func TestConfigOverlay(t *testing.T) {
 		HealthChecks:          boolPtr(false),
 		Metrics:               boolPtr(false),
 		Tracing:               boolPtr(false),
-		Address:               "127.0.0.1:1234",
+		Bind:                  Bind{"127.0.0.1:1234"},
 		HealthCheckTimeoutSec: 5,
 		TraceEndpoint:         "collector:4317",
 		ServiceName:           "svc",
+		TraceSampleRatio:      floatPtr(0.1),
 	}))
 	if c.healthChecks || c.metrics || c.tracing {
 		t.Fatal("explicit false values must disable the features")
 	}
-	if c.bindAddress != "127.0.0.1:1234" || c.healthCheckTimeout != 5*time.Second ||
-		c.traceEndpoint != "collector:4317" || c.serviceName != "svc" {
-		t.Fatalf("config overlay = %q %v %q %q", c.bindAddress, c.healthCheckTimeout, c.traceEndpoint, c.serviceName)
+	if firstBind(c) != "127.0.0.1:1234" || c.healthCheckTimeout != 5*time.Second ||
+		c.traceEndpoint != "collector:4317" || c.serviceName != "svc" || c.sampleRatio != 0.1 {
+		t.Fatalf("config overlay = %q %v %q %q", firstBind(c), c.healthCheckTimeout, c.traceEndpoint, c.serviceName)
 	}
 
 	// option-set values survive when the loaded config omits the field
-	m := New(WithAddress("127.0.0.1:7777"), WithServiceName("opt"), WithConfig(ObservabilityConfig{}))
-	if m.bindAddress != "127.0.0.1:7777" || m.serviceName != "opt" {
-		t.Fatalf("empty config must keep option-set values, got %q %q", m.bindAddress, m.serviceName)
+	m := New(WithBind("127.0.0.1:7777"), WithServiceName("opt"), WithConfig(ObservabilityConfig{}))
+	if firstBind(m) != "127.0.0.1:7777" || m.serviceName != "opt" {
+		t.Fatalf("empty config must keep option-set values, got %q %q", firstBind(m), m.serviceName)
 	}
 }
 
@@ -231,7 +243,7 @@ func TestHealthChecksDisabled(t *testing.T) {
 }
 
 func TestReadinessAggregatesHealthProviders(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	ok := &testProvider{name: "ok"}
 	bad := &testProvider{name: "bad"}
 	bad.setErr(errors.New("down"))
@@ -269,7 +281,7 @@ func TestReadinessAggregatesHealthProviders(t *testing.T) {
 }
 
 func TestReadinessTimesOutSlowProviders(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"), WithHealthCheckTimeout(100*time.Millisecond))
+	o := New(WithBind("127.0.0.1:0"), WithHealthCheckTimeout(100*time.Millisecond))
 	slow := &testProvider{name: "slow"}
 	slow.mu.Lock()
 	slow.health = func(ctx context.Context) error {
@@ -292,7 +304,7 @@ func TestReadinessTimesOutSlowProviders(t *testing.T) {
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("/readyz with a hung provider = %d, want 503", code)
 	}
-	if !strings.Contains(body, "timed out") {
+	if !strings.Contains(body, "timed_out") {
 		t.Fatalf("/readyz body = %q, want a timeout report", body)
 	}
 	if elapsed > 2*time.Second {
@@ -301,7 +313,7 @@ func TestReadinessTimesOutSlowProviders(t *testing.T) {
 }
 
 func TestShutdownStopsServer(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	startHTTP(t, o)
@@ -325,7 +337,7 @@ func TestShutdownStopsServer(t *testing.T) {
 }
 
 func TestInitTwiceIsIdempotent(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	if o.Address() != "" {
@@ -351,7 +363,7 @@ func TestInitTwiceIsIdempotent(t *testing.T) {
 }
 
 func TestLivenessDoesNotFailOnComponentHealth(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	bad := &testProvider{name: "bad"}
 	bad.setErr(errors.New("down"))
 	fw := newTestFW(t, o, bad)
@@ -365,7 +377,7 @@ func TestLivenessDoesNotFailOnComponentHealth(t *testing.T) {
 }
 
 func TestMetricsEndpointLazyPickup(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	mp := &testMetricsProvider{plainComp: &plainComp{name: "app"}}
 	fw := newTestFW(t, o, mp)
 	initFW(t, fw)
@@ -420,7 +432,7 @@ func (m *testCounterProvider) Metrics() []Metric {
 }
 
 func TestMetricsCounterTypeScrapedAsCounter(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	cp := &testCounterProvider{plainComp: &plainComp{name: "app"}}
 	fw := newTestFW(t, o, cp)
 	initFW(t, fw)
@@ -446,7 +458,7 @@ func TestMetricsCounterTypeScrapedAsCounter(t *testing.T) {
 }
 
 func TestMetricsDisabled(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"), WithMetrics(false))
+	o := New(WithBind("127.0.0.1:0"), WithMetrics(false))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	startHTTP(t, o)
@@ -460,7 +472,7 @@ func TestMetricsDisabled(t *testing.T) {
 }
 
 func TestMetricsServedWithoutHealthChecks(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"), WithHealthChecks(false))
+	o := New(WithBind("127.0.0.1:0"), WithHealthChecks(false))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	startHTTP(t, o)
@@ -478,7 +490,7 @@ func TestMetricsServedWithoutHealthChecks(t *testing.T) {
 }
 
 func TestTracingDisabledWithoutEndpoint(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	if o.TracerProvider() != nil {
@@ -487,7 +499,7 @@ func TestTracingDisabledWithoutEndpoint(t *testing.T) {
 }
 
 func TestTracingExplicitlyDisabled(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"), WithTracing(false), WithTraceEndpoint("127.0.0.1:4317"))
+	o := New(WithBind("127.0.0.1:0"), WithTracing(false), WithTraceEndpoint("127.0.0.1:4317"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	if o.TracerProvider() != nil {
@@ -499,7 +511,7 @@ func TestTracingEnabledWithEndpoint(t *testing.T) {
 	prev := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
-	o := New(WithAddress("127.0.0.1:0"), WithTracing(true), WithTraceEndpoint("127.0.0.1:1"))
+	o := New(WithBind("127.0.0.1:0"), WithTracing(true), WithTraceEndpoint("127.0.0.1:1"), WithTraceInsecure(true))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 
@@ -512,8 +524,32 @@ func TestTracingEnabledWithEndpoint(t *testing.T) {
 	}
 }
 
+func TestTracingRejectsInvalidSampleRatio(t *testing.T) {
+	o := New(WithBind("127.0.0.1:0"), WithTracing(true), WithTraceEndpoint("127.0.0.1:1"),
+		WithTraceInsecure(true), WithTraceSampleRatio(1.5))
+	fw := newTestFW(t, o)
+	if err := fw.Initialize(context.Background()); err == nil {
+		t.Fatal("Init should reject trace_sample_ratio outside 0–1")
+	}
+}
+
+func TestSamplerForRatio(t *testing.T) {
+	if _, err := samplerForRatio(-0.1); err == nil {
+		t.Fatal("want error for negative ratio")
+	}
+	if _, err := samplerForRatio(1.1); err == nil {
+		t.Fatal("want error for ratio > 1")
+	}
+	if _, err := samplerForRatio(0); err != nil {
+		t.Fatalf("0 is valid: %v", err)
+	}
+	if _, err := samplerForRatio(1); err != nil {
+		t.Fatalf("1 is valid: %v", err)
+	}
+}
+
 func TestInitDoesNotListen(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	fw := newTestFW(t, o)
 	initFW(t, fw)
 	if addr := o.Address(); addr != "" {
@@ -522,7 +558,7 @@ func TestInitDoesNotListen(t *testing.T) {
 }
 
 func TestRunBeforeInit(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	err := o.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "Run before Init") {
 		t.Fatalf("Run before Init = %v, want Run before Init", err)
@@ -543,7 +579,7 @@ func (j *jobTarget) RunJob(context.Context, string) error {
 }
 
 func TestJobPathDoesNotListen(t *testing.T) {
-	o := New(WithAddress("127.0.0.1:0"))
+	o := New(WithBind("127.0.0.1:0"))
 	target := &jobTarget{plainComp: &plainComp{name: "migrator"}, obs: o}
 	fw := newTestFW(t, o, target)
 	if err := fw.RunJob(context.Background(), "migrator", "migrate"); err != nil {

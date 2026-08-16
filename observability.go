@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"math"
 	"net/http"
-	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/credentials"
 )
 
 // ComponentName is the framework component name for the observability
@@ -38,25 +39,36 @@ type ObservabilityConfig struct {
 	// *bool so an absent key is distinguishable from an explicit
 	// health_checks: false, which is required to turn the endpoints off (the
 	// component's default is enabled).
-	HealthChecks *bool `json:"health_checks,omitempty" yaml:"health_checks,omitempty"`
+	HealthChecks *bool `json:"health_checks,omitempty" yaml:"health_checks,omitempty" env:"HEALTH_CHECKS" flag:"observability-health-checks"`
 	// Metrics enables the /metrics endpoint (Prometheus text format; default
 	// enabled). It is a *bool so an explicit metrics: false is honored.
-	Metrics *bool `json:"metrics,omitempty" yaml:"metrics,omitempty"`
+	Metrics *bool `json:"metrics,omitempty" yaml:"metrics,omitempty" env:"METRICS" flag:"observability-metrics"`
 	// Tracing enables OpenTelemetry trace export over OTLP/gRPC (default off;
 	// internal tracing mechanics stay dark until enabled). It is a *bool so an
 	// explicit tracing: false is honored.
-	Tracing *bool `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	// Address is the bind address for the HTTP server (default ":9090").
-	Address string `json:"address,omitempty" yaml:"address,omitempty"`
+	Tracing *bool `json:"tracing,omitempty" yaml:"tracing,omitempty" env:"TRACING" flag:"observability-tracing"`
+	// Bind is the operator HTTP listen address(es). A JSON string is one
+	// listener (":9090"); an array is multibind (ports may differ). Omit keeps
+	// the default ":9090".
+	Bind Bind `json:"bind,omitempty" yaml:"bind,omitempty" env:"BIND" flag:"observability-bind"`
 	// HealthCheckTimeoutSec bounds each component health check (default 2).
-	HealthCheckTimeoutSec int `json:"health_check_timeout_sec,omitempty" yaml:"health_check_timeout_sec,omitempty"`
+	HealthCheckTimeoutSec int `json:"health_check_timeout_sec,omitempty" yaml:"health_check_timeout_sec,omitempty" env:"HEALTH_CHECK_TIMEOUT_SEC" flag:"observability-health-check-timeout-sec"`
 	// TraceEndpoint is the OTLP/gRPC collector endpoint (e.g.
 	// "otel-collector:4317"). When set and tracing is enabled, spans are
-	// exported to it (insecure transport).
-	TraceEndpoint string `json:"trace_endpoint,omitempty" yaml:"trace_endpoint,omitempty"`
+	// exported to it.
+	TraceEndpoint string `json:"trace_endpoint,omitempty" yaml:"trace_endpoint,omitempty" env:"TRACE_ENDPOINT" flag:"observability-trace-endpoint"`
+	// TraceInsecure admits cleartext OTLP. Default false (TLS). Ops must set
+	// true to talk to a collector without TLS.
+	TraceInsecure bool `json:"trace_insecure,omitempty" yaml:"trace_insecure,omitempty" env:"TRACE_INSECURE" flag:"observability-trace-insecure"`
+	// TraceCAFile is an optional PEM CA file for TLS OTLP (empty = system roots).
+	TraceCAFile string `json:"trace_ca_file,omitempty" yaml:"trace_ca_file,omitempty" env:"TRACE_CA_FILE" flag:"observability-trace-ca-file"`
+	// TraceSampleRatio is head sampling in this process (0–1). Nil keeps the
+	// default 1.0 (same as AlwaysSample). Explicit 0 means new traces are not
+	// sampled; children still follow a sampled parent (ParentBased).
+	TraceSampleRatio *float64 `json:"trace_sample_ratio,omitempty" yaml:"trace_sample_ratio,omitempty" env:"TRACE_SAMPLE_RATIO" flag:"observability-trace-sample-ratio"`
 	// ServiceName is the OpenTelemetry service.name attribute attached to
 	// exported spans (default "caerus").
-	ServiceName string `json:"service_name,omitempty" yaml:"service_name,omitempty"`
+	ServiceName string `json:"service_name,omitempty" yaml:"service_name,omitempty" env:"SERVICE_NAME" flag:"observability-service-name"`
 }
 
 // Option configures the observability component at construction time.
@@ -66,9 +78,12 @@ type options struct {
 	healthChecks       bool
 	metrics            bool
 	tracing            bool
-	address            string
+	binds              []string
 	healthCheckTimeout time.Duration
 	traceEndpoint      string
+	traceInsecure      bool
+	traceCAFile        string
+	sampleRatio        float64
 	serviceName        string
 	loaded             *ObservabilityConfig // set by WithConfig; overrides option-set defaults
 	configSource       string               // configuration source for OnConfigReload ("" = none)
@@ -94,9 +109,9 @@ func WithTracing(enabled bool) Option {
 	return func(o *options) { o.tracing = enabled }
 }
 
-// WithAddress sets the bind address for the HTTP server (default ":9090").
-func WithAddress(addr string) Option {
-	return func(o *options) { o.address = addr }
+// WithBind sets one or more host:port listen addresses (default ":9090").
+func WithBind(addrs ...string) Option {
+	return func(o *options) { o.binds = append([]string{}, addrs...) }
 }
 
 // WithHealthCheckTimeout sets the deadline for each component health check
@@ -105,10 +120,27 @@ func WithHealthCheckTimeout(d time.Duration) Option {
 	return func(o *options) { o.healthCheckTimeout = d }
 }
 
-// WithTraceEndpoint sets the OTLP/gRPC collector endpoint. The connection is
-// insecure and only created when tracing is enabled.
+// WithTraceEndpoint sets the OTLP/gRPC collector endpoint. Only used when
+// tracing is enabled. TLS is the default; set WithTraceInsecure(true) to
+// admit cleartext.
 func WithTraceEndpoint(endpoint string) Option {
 	return func(o *options) { o.traceEndpoint = endpoint }
+}
+
+// WithTraceInsecure admits cleartext OTLP when true. Default false (TLS).
+func WithTraceInsecure(insecure bool) Option {
+	return func(o *options) { o.traceInsecure = insecure }
+}
+
+// WithTraceCAFile sets an optional PEM CA path for TLS OTLP.
+func WithTraceCAFile(path string) Option {
+	return func(o *options) { o.traceCAFile = path }
+}
+
+// WithTraceSampleRatio sets head sampling for new traces (0–1, default 1.0).
+// Invalid values fail when the tracer provider is built (Init / tracing reload).
+func WithTraceSampleRatio(ratio float64) Option {
+	return func(o *options) { o.sampleRatio = ratio }
 }
 
 // WithServiceName sets the OpenTelemetry service.name attribute (default
@@ -162,14 +194,23 @@ func overlayConfig(o *options, cfg ObservabilityConfig) {
 	if cfg.Tracing != nil {
 		o.tracing = *cfg.Tracing
 	}
-	if cfg.Address != "" {
-		o.address = cfg.Address
+	if len(cfg.Bind) > 0 {
+		o.binds = append([]string{}, cfg.Bind...)
 	}
 	if cfg.HealthCheckTimeoutSec != 0 {
 		o.healthCheckTimeout = time.Duration(cfg.HealthCheckTimeoutSec) * time.Second
 	}
 	if cfg.TraceEndpoint != "" {
 		o.traceEndpoint = cfg.TraceEndpoint
+	}
+	if cfg.TraceInsecure {
+		o.traceInsecure = true
+	}
+	if cfg.TraceCAFile != "" {
+		o.traceCAFile = cfg.TraceCAFile
+	}
+	if cfg.TraceSampleRatio != nil {
+		o.sampleRatio = *cfg.TraceSampleRatio
 	}
 	if cfg.ServiceName != "" {
 		o.serviceName = cfg.ServiceName
@@ -203,9 +244,12 @@ type Observability struct {
 	registry           *prometheus.Registry
 	tracing            bool
 	traceEndpoint      string
+	traceInsecure      bool
+	traceCAFile        string
+	sampleRatio        float64
 	serviceName        string
 	tp                 *trace.TracerProvider
-	bindAddress        string
+	binds              []string
 	configSource       string
 	providers          []namedHealth
 	handler            http.Handler
@@ -236,9 +280,10 @@ func New(opts ...Option) *Observability {
 		healthChecks:       true,
 		metrics:            true,
 		tracing:            false,
-		address:            ":9090",
+		binds:              []string{":9090"},
 		healthCheckTimeout: 2 * time.Second,
 		serviceName:        "caerus",
+		sampleRatio:        1,
 		logger:             slog.Default(),
 	}
 	for _, opt := range opts {
@@ -253,8 +298,11 @@ func New(opts ...Option) *Observability {
 		metrics:            o.metrics,
 		tracing:            o.tracing,
 		traceEndpoint:      o.traceEndpoint,
+		traceInsecure:      o.traceInsecure,
+		traceCAFile:        o.traceCAFile,
+		sampleRatio:        o.sampleRatio,
 		serviceName:        o.serviceName,
-		bindAddress:        o.address,
+		binds:              append([]string{}, o.binds...),
 		configSource:       o.configSource,
 		logger:             o.logger,
 		loggerSet:          o.loggerSet,
@@ -326,12 +374,8 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 		if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
 			registry.MustRegister(&logsMetricsCollector{logs: logs})
 		}
-		if c.configSource != "" {
-			// Configuration metrics are only meaningful when this component is
-			// bound to a source; without one the dependency is not declared.
-			if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
-				registry.MustRegister(&configurationMetricsCollector{conf: conf})
-			}
+		if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
+			registry.MustRegister(&configurationMetricsCollector{conf: conf})
 		}
 		c.registry = registry
 	}
@@ -370,7 +414,7 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 		"health_checks", c.healthChecks,
 		"metrics", c.metrics,
 		"providers", len(c.providers),
-		"bind_address", c.bindAddress,
+		"bind", c.binds,
 	)
 	return nil
 }
@@ -397,7 +441,7 @@ func (c *Observability) Run(ctx context.Context) error {
 		return nil
 	}
 	handler := c.handler
-	bindAddress := c.bindAddress
+	binds := append([]string{}, c.binds...)
 	c.running = true
 	c.mu.Unlock()
 	defer func() {
@@ -411,12 +455,17 @@ func (c *Observability) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", bindAddress)
+	if len(binds) == 0 {
+		binds = []string{":9090"}
+	}
+	lns, err := listenAll(binds)
 	if err != nil {
-		return fmt.Errorf("cf_observability: listen %s: %w", bindAddress, err)
+		return fmt.Errorf("cf_observability: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		_ = ln.Close()
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
 		return err
 	}
 	server := &http.Server{
@@ -425,7 +474,7 @@ func (c *Observability) Run(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	c.server = server
-	c.addr = ln.Addr().String()
+	c.addr = pickBoundAddr(lns)
 	addr := c.addr
 	providers := len(c.providers)
 	healthChecks := c.healthChecks
@@ -438,16 +487,36 @@ func (c *Observability) Run(ctx context.Context) error {
 		"providers", providers,
 	)
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- server.Serve(ln) }()
+	nServe := len(lns)
+	errCh := make(chan error, nServe)
+	for _, ln := range lns {
+		ln := ln
+		go func() { errCh <- server.Serve(ln) }()
+	}
+
+	drainServe := func(already int) error {
+		var last error
+		for i := already; i < nServe; i++ {
+			if e := normalizeHTTPServerError(<-errCh); e != nil {
+				last = e
+			}
+		}
+		return last
+	}
 
 	select {
 	case err := <-errCh:
-		return normalizeHTTPServerError(err)
+		first := normalizeHTTPServerError(err)
+		_ = server.Close()
+		rest := drainServe(1)
+		if first != nil {
+			return first
+		}
+		return rest
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpDrainTimeout)
 		shutdownErr := server.Shutdown(shutdownCtx)
-		serveErr := normalizeHTTPServerError(<-errCh)
+		serveErr := drainServe(0)
 		cancel()
 		if shutdownErr != nil {
 			c.logger.Error("cf_observability: graceful shutdown failed", "err", shutdownErr)
@@ -478,14 +547,21 @@ func (c *Observability) applyConfigLocked(cfg ObservabilityConfig) {
 	if cfg.Tracing != nil {
 		c.tracing = *cfg.Tracing
 	}
-	if cfg.Address != "" {
-		c.bindAddress = cfg.Address
+	if len(cfg.Bind) > 0 {
+		c.binds = append([]string{}, cfg.Bind...)
 	}
 	if cfg.HealthCheckTimeoutSec != 0 {
 		c.healthCheckTimeout = time.Duration(cfg.HealthCheckTimeoutSec) * time.Second
 	}
 	if cfg.TraceEndpoint != "" {
 		c.traceEndpoint = cfg.TraceEndpoint
+	}
+	c.traceInsecure = cfg.TraceInsecure
+	if cfg.TraceCAFile != "" {
+		c.traceCAFile = cfg.TraceCAFile
+	}
+	if cfg.TraceSampleRatio != nil {
+		c.sampleRatio = *cfg.TraceSampleRatio
 	}
 	if cfg.ServiceName != "" {
 		c.serviceName = cfg.ServiceName
@@ -497,19 +573,22 @@ func (c *Observability) applyConfigLocked(cfg ObservabilityConfig) {
 // returns the error and keeps the previous state (last-good).
 func (c *Observability) reconcileTracingLocked() error {
 	if c.tracing && c.traceEndpoint != "" {
-		if c.tp != nil {
-			return nil
-		}
-		tp, err := newTracerProvider(context.Background(), c.traceEndpoint, c.serviceName)
+		tp, err := newTracerProvider(context.Background(), c.traceEndpoint, c.serviceName, c.traceInsecure, c.traceCAFile, c.sampleRatio)
 		if err != nil {
 			return err
 		}
+		old := c.tp
 		c.tp = tp
 		otel.SetTracerProvider(tp)
 		c.logger.Info("cf_observability: tracing enabled",
 			"endpoint", c.traceEndpoint,
 			"service", c.serviceName,
+			"insecure", c.traceInsecure,
+			"sample_ratio", c.sampleRatio,
 		)
+		if old != nil {
+			_ = old.Shutdown(context.Background())
+		}
 		return nil
 	}
 	if c.tp != nil {
@@ -546,16 +625,23 @@ func (c *Observability) OnConfigReload(source string, cfg any) {
 		c.mu.Unlock()
 		return
 	}
-	prevTracing, prevEndpoint := c.tracing, c.traceEndpoint
-	prevAddr, prevHealth, prevMetrics := c.bindAddress, c.healthChecks, c.metrics
+	prevTracing, prevEndpoint, prevService := c.tracing, c.traceEndpoint, c.serviceName
+	prevInsecure, prevCA, prevRatio := c.traceInsecure, c.traceCAFile, c.sampleRatio
+	prevBinds, prevHealth, prevMetrics := append([]string{}, c.binds...), c.healthChecks, c.metrics
 	c.applyConfigLocked(*oc)
-	tracingChanged := c.tracing != prevTracing || c.traceEndpoint != prevEndpoint
+	tracingChanged := c.tracing != prevTracing || c.traceEndpoint != prevEndpoint ||
+		c.serviceName != prevService || c.traceInsecure != prevInsecure ||
+		c.traceCAFile != prevCA || c.sampleRatio != prevRatio
 	var tracingErr error
 	if tracingChanged {
 		tracingErr = c.reconcileTracingLocked()
+		if tracingErr != nil {
+			c.tracing, c.traceEndpoint, c.serviceName = prevTracing, prevEndpoint, prevService
+			c.traceInsecure, c.traceCAFile, c.sampleRatio = prevInsecure, prevCA, prevRatio
+		}
 	}
-	restart := c.bindAddress != prevAddr || c.healthChecks != prevHealth || c.metrics != prevMetrics
-	newAddr, newHealth, newMetrics := c.bindAddress, c.healthChecks, c.metrics
+	restart := !bindsEqual(c.binds, prevBinds) || c.healthChecks != prevHealth || c.metrics != prevMetrics
+	newBinds, newHealth, newMetrics := c.binds, c.healthChecks, c.metrics
 	c.mu.Unlock()
 
 	if tracingErr != nil {
@@ -563,7 +649,7 @@ func (c *Observability) OnConfigReload(source string, cfg any) {
 	}
 	if restart {
 		c.logger.Warn("cf_observability: HTTP endpoint changes need a restart to apply",
-			"address", newAddr,
+			"bind", newBinds,
 			"health_checks", newHealth,
 			"metrics", newMetrics,
 		)
@@ -635,13 +721,24 @@ func (c *Observability) TracerProvider() oteltrace.TracerProvider {
 	return c.tp
 }
 
-// newTracerProvider builds an OTLP/gRPC-backed tracer provider that always
-// samples and tags every span with the service name.
-func newTracerProvider(ctx context.Context, endpoint, serviceName string) (*trace.TracerProvider, error) {
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+// newTracerProvider builds an OTLP/gRPC-backed tracer provider with
+// ParentBased TraceIDRatio sampling and service.name on every span.
+func newTracerProvider(ctx context.Context, endpoint, serviceName string, insecure bool, caFile string, sampleRatio float64) (*trace.TracerProvider, error) {
+	sampler, err := samplerForRatio(sampleRatio)
+	if err != nil {
+		return nil, err
+	}
+	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(endpoint)}
+	if insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	} else if caFile != "" {
+		creds, err := credentials.NewClientTLSFromFile(caFile, "")
+		if err != nil {
+			return nil, fmt.Errorf("cf_observability: load OTLP CA %s: %w", caFile, err)
+		}
+		opts = append(opts, otlptracegrpc.WithTLSCredentials(creds))
+	}
+	exporter, err := otlptracegrpc.New(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("cf_observability: create OTLP trace exporter: %w", err)
 	}
@@ -653,9 +750,16 @@ func newTracerProvider(ctx context.Context, endpoint, serviceName string) (*trac
 	}
 	return trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
-		trace.WithSampler(trace.AlwaysSample()),
+		trace.WithSampler(sampler),
 		trace.WithResource(res),
 	), nil
+}
+
+func samplerForRatio(r float64) (trace.Sampler, error) {
+	if r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+		return nil, fmt.Errorf("cf_observability: trace_sample_ratio must be between 0 and 1 inclusive, got %v", r)
+	}
+	return trace.ParentBased(trace.TraceIDRatioBased(r)), nil
 }
 
 // metricsCollector bridges a MetricsProvider into the Prometheus registry.
@@ -672,25 +776,9 @@ type metricsCollector struct {
 func (mc *metricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (mc *metricsCollector) Collect(ch chan<- prometheus.Metric) {
+	defer recoverCollect(mc.name)
 	for _, m := range mc.provider.Metrics() {
-		if m.Name == "" {
-			continue
-		}
-		labelNames := make([]string, 0, len(m.Labels))
-		for name := range m.Labels {
-			labelNames = append(labelNames, name)
-		}
-		sort.Strings(labelNames)
-		labelValues := make([]string, 0, len(labelNames))
-		for _, name := range labelNames {
-			labelValues = append(labelValues, m.Labels[name])
-		}
-		desc := prometheus.NewDesc(m.Name, m.Help, labelNames, nil)
-		vt := prometheus.GaugeValue
-		if m.Type == MetricTypeCounter {
-			vt = prometheus.CounterValue
-		}
-		ch <- prometheus.MustNewConstMetric(desc, vt, m.Value, labelValues...)
+		emitMetric(ch, m)
 	}
 }
 
@@ -720,9 +808,11 @@ func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		if expired {
-			failures = append(failures, fmt.Sprintf("%s: timed out", p.name))
+			c.logger.Error("cf_observability: health check timed out", "component", p.name)
+			failures = append(failures, fmt.Sprintf("%s: timed_out", p.name))
 		} else {
-			failures = append(failures, fmt.Sprintf("%s: %v", p.name, err))
+			c.logger.Error("cf_observability: health check failed", "component", p.name, "err", err)
+			failures = append(failures, fmt.Sprintf("%s: %s", p.name, healthReason(err)))
 		}
 	}
 	if len(failures) == 0 {
@@ -736,6 +826,20 @@ func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request)
 	for _, f := range failures {
 		fmt.Fprintln(w, "fail:", f)
 	}
+}
+
+func healthReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "not initialized") {
+		return "not_initialized"
+	}
+	if strings.Contains(msg, "ping") {
+		return "ping_failed"
+	}
+	return "unhealthy"
 }
 
 var _ cf.CaerusComponent = (*Observability)(nil)
