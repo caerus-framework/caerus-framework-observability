@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/caerus-framework/caerus-framework v0.0.12
-	github.com/caerus-framework/caerus-framework-configuration v0.0.13
+	github.com/caerus-framework/caerus-framework-configuration v0.0.14
 	github.com/caerus-framework/caerus-framework-logs v0.0.11
 	github.com/prometheus/client_golang v1.24.1
 	go.opentelemetry.io/otel v1.45.0
@@ -40,8 +40,8 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260818201246-1b0934165a6f // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260818201246-1b0934165a6f // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
