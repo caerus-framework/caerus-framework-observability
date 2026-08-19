@@ -1,6 +1,8 @@
 package cf_observability
 
 import (
+	"fmt"
+
 	cf "github.com/caerus-framework/caerus-framework"
 )
 
@@ -22,6 +24,20 @@ func (c *Observability) CoreConfigSource() ([]cf.ConfigSourceValue, error) {
 		Format:    "json",
 		EnvPrefix: "OBSERVABILITY_",
 		Owner:     ComponentName,
+		Validate:  validateObservabilityConfigValue,
 		Sample:    ObservabilityConfig{},
 	}}, nil
+}
+
+func validateObservabilityConfigValue(v any) error {
+	cfg, ok := v.(*ObservabilityConfig)
+	if !ok {
+		return fmt.Errorf("cf_observability: validate config: unexpected type %T", v)
+	}
+	if cfg.TraceSampleRatio != nil {
+		if _, err := samplerForRatio(*cfg.TraceSampleRatio); err != nil {
+			return err
+		}
+	}
+	return nil
 }
