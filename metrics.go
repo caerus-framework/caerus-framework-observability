@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
-	"strings"
 
 	cf "github.com/caerus-framework/caerus-framework"
 	cf_configuration "github.com/caerus-framework/caerus-framework-configuration"
@@ -114,19 +113,14 @@ func (c *configurationMetricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	defer recoverCollect("configuration")
-	sources := c.conf.Sources()
-	if len(sources) == 0 {
-		return
+	for _, sample := range c.conf.MetricSamples() {
+		emitMetric(ch, Metric{
+			Name:   sample.Name,
+			Help:   sample.Help,
+			Value:  sample.Value,
+			Labels: sample.Labels,
+		})
 	}
-	m := Metric{
-		Name:  "configuration_info",
-		Help:  "Registered configuration sources.",
-		Value: float64(len(sources)),
-		Labels: map[string]string{
-			"sources": strings.Join(sources, ","),
-		},
-	}
-	emitMetric(ch, m)
 }
 
 func emitMetric(ch chan<- prometheus.Metric, m Metric) {
