@@ -356,9 +356,9 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 	// arrive via OnConfigReload.
 	if c.configSource != "" {
 		if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
-			if cfg, err := cf_configuration.Lookup[ObservabilityConfig](conf, c.configSource); err == nil {
-				c.applyConfigLocked(*cfg)
-			}
+		if cfg, err := cf_configuration.Lookup[ObservabilityConfig](conf, c.configSource); err == nil {
+			c.applyConfigLocked(cfg)
+		}
 		}
 	}
 
