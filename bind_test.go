@@ -25,3 +25,15 @@ func TestBindUnmarshalJSON(t *testing.T) {
 		t.Fatal("empty array must fail")
 	}
 }
+
+func TestValidateRejectsBadBind(t *testing.T) {
+	if err := validateObservabilityConfigValue(&ObservabilityConfig{Bind: Bind{"not-a-port"}}); err == nil {
+		t.Fatal("expected bind validation error")
+	}
+	if err := validateObservabilityConfigValue(&ObservabilityConfig{}); err != nil {
+		t.Fatalf("empty bind must skip parse: %v", err)
+	}
+	if err := validateObservabilityConfigValue(&ObservabilityConfig{Bind: Bind{":9090"}}); err != nil {
+		t.Fatalf("good bind: %v", err)
+	}
+}

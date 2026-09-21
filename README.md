@@ -106,26 +106,82 @@ Right: Init prepares; Run binds. Jobs skip Runnables, so one-shot work has
 ```
 
 Configure Kubernetes probes and Prometheus scrapes on **serving** pods, not
-on Job pods. `/metrics` has no scrape auth in this module.
+on Job pods. This module does **not** authenticate scrapes today (no bearer
+token, no BasicAuth, no mTLS on `/metrics`). That is a **TODO for later**.
+Until then, pick a bind the scraper can actually reach, then restrict who
+may connect with NetworkPolicy and/or a service mesh.
 
-### Who may hit `:9090` (NetworkPolicy)
+### Bind and who may hit the shop window
 
-Default `bind` is `:9090` (all interfaces). The shop window is then
-reachable from anything that can route to the pod IP on that port —
-kubelet probes, an in-cluster Prometheus, **and** any other pod unless
-you restrict it. That is an **ops-plane** problem, not something this
-module solves with mTLS.
+`bind` is an ordinary listen address, the same kind of setting Prometheus
+exporters (`node_exporter --web.listen-address`, Grafana Alloy, OTel
+Collector) expose. This module does **not** pick a “safe” address for you.
+You bind where the scraper and kubelet must connect; isolation is a
+separate ops step.
 
-Path A — Cluster scrape (recommended for serve Deployments):
+Default is `:9090` (all interfaces, port 9090). That is the exporter
+convention: omit the host, listen on every NIC. It is the right default
+for Kubernetes serve pods and for an external scraper that must hit the
+process. It is **not** “metrics are internal.” Anything that can route to
+that address can GET `/metrics` unless you restrict it.
 
-Keep `bind: ":9090"` so kubelet and Prometheus can reach the pod IP.
-Allow **ingress TCP 9090** only from:
+```mermaid
+flowchart TD
+  pick[Pick bind so the scraper can connect]
+  pick -->|same host only| lo["127.0.0.1:9090"]
+  pick -->|kubelet / in-cluster / off-host scraper| all[":9090 or 0.0.0.0:9090"]
+  all --> isolate[Restrict who may connect]
+  isolate --> np[NetworkPolicy]
+  isolate --> mesh[Service mesh mTLS plus mesh authz]
+  isolate --> later["TODO later: scrape auth in this module"]
+```
+
+The bind choice and the isolation choice are two different questions.
+Answer both. Do not collapse them into one sentence.
+
+**Bind Path A — Reachable address (default, Kubernetes serve, external scraper)**
+
+Use `:9090` or `0.0.0.0:9090`, or a specific NIC if you have one. Kubelet
+probes hit the **pod IP**, not localhost. In-cluster Prometheus /
+Prometheus Operator `ServiceMonitor` scrape the **pod IP** (or a Service
+that forwards to it). An external scraper (Prometheus outside the cluster,
+a vendor SaaS, a scrape from another VPC) also needs a reachable address
+plus whatever Service / LoadBalancer / Ingress / hostNetwork you put in
+front of the port.
+
+```json
+{ "bind": ":9090" }
+```
+
+Loopback (`127.0.0.1:9090`) is **overkill here and will not work**: the
+scraper is not in this process’s network namespace. Binding loopback does
+not “harden” a cluster scrape; it just makes kubelet and Prometheus fail
+to connect.
+
+**Bind Path B — Loopback (laptop / `go run` / sidecar on localhost)**
+
+Use this only when the scraper (or a human curling `/metrics`) shares the
+host with the process:
+
+```json
+{ "bind": "127.0.0.1:9090" }
+```
+
+Nothing off-box can connect. Do **not** use Bind Path B on a Kubernetes
+serve pod if kubelet must probe `/readyz` or Prometheus must scrape
+`/metrics`.
+
+**Isolation Path A — Kubernetes NetworkPolicy (recommended for serve Deployments)**
+
+After Bind Path A, allow **ingress TCP 9090** only from:
 
 - the nodes / kubelet (liveness and readiness probes), and
 - the namespace (or PodSelector) that runs Prometheus / Grafana Alloy.
 
 Deny 9090 from the public Ingress and from app namespaces that have no
-reason to scrape. Example shape (adjust labels to your cluster):
+reason to scrape. A ClusterIP Service is **not** isolation — any pod that
+can route to the pod IP can still connect. Put a Policy like this in the
+**product Helm chart** (this module cannot enforce it):
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -149,19 +205,42 @@ spec:
           port: 9090
 ```
 
-Path B — Loopback only (laptop / `go run`):
+Adjust labels, namespaces, and the kubelet `from` rule to the cluster’s
+CNI. Some meshes (see Isolation Path B) replace or sit beside this Policy;
+the example is the default Kubernetes-only shape.
 
-```json
-{ "bind": "127.0.0.1:9090" }
+**Isolation Path B — Service mesh**
+
+If the cluster already runs a mesh (Istio, Linkerd, Cilium mTLS, and so
+on), you can require mTLS on port 9090 and allow only the Prometheus
+identity (PeerAuthentication / AuthorizationPolicy, or the mesh’s
+equivalent). This module does **not** configure the mesh. Mesh authz is
+an extra isolation layer, not a second bind address, and not scrape auth
+inside `cf_observability`.
+
+**Later — scrape auth in this module (TODO)**
+
+Bearer tokens, BasicAuth, or process-local mTLS on `/metrics` are **not
+implemented**. Do not expect this binary to check a scrape secret today.
+Track that as a later design; until then Isolation Path A and/or B are
+the protection.
+
+```text
+Wrong: bind 127.0.0.1:9090 in Kubernetes so /metrics is “safe”, then
+       expect kubelet or an external Prometheus to scrape the pod.
+Right: Bind Path A (`:9090`) so the scraper can connect, then Isolation
+       Path A (NetworkPolicy) and/or Isolation Path B (mesh).
+
+Wrong: all-interfaces bind and no Policy, then treating /metrics as
+       internal because the Service is ClusterIP.
+Right: Bind Path A plus a Policy (and/or mesh). ClusterIP is not a
+       firewall.
+
+Wrong: waiting for scrape auth in this module before shipping a serve
+       chart.
+Right: ship the NetworkPolicy (Isolation Path A) now; scrape auth is a
+       later TODO.
 ```
-
-Nothing on the cluster network can scrape or probe that port. Do **not**
-use Path B on a Kubernetes serve pod if you still want `/readyz` and
-`/metrics` from kubelet/Prometheus.
-
-Wrong: all-interfaces bind and no NetworkPolicy, then treating `/metrics`
-as “internal” because the Service is ClusterIP.  
-Right: Path A bind + Policy, or Path B only when the process is local.
 
 ### Optional component health checks
 
@@ -239,19 +318,34 @@ observability:
 | `WithHealthChecks(bool)` | `true` | Enable the Kubernetes health-check endpoints. |
 | `WithMetrics(bool)` | `true` | Enable the `/metrics` endpoint. |
 | `WithTracing(bool)` | `false` | Enable trace export (active once an endpoint is set). |
-| `WithBind(...string)` | `":9090"` | Listen address(es); one string or several `host:port`. |
+| `WithBind(...string)` | `":9090"` (all interfaces) | Listen address(es) you choose — same idea as other exporters. Loopback (`127.0.0.1:9090`) is laptop/sidecar only; cluster and external scrapers need a reachable bind. |
 | `WithHealthCheckTimeout(d)` | `2s` | Deadline for each component health check. |
 | `WithTraceEndpoint(string)` | `""` (tracing latent) | OTLP/gRPC collector endpoint. |
 | `WithTraceInsecure(bool)` | `false` (TLS) | Admit cleartext OTLP. |
 | `WithTraceSampleRatio(float64)` | `1.0` | Head sampling 0–1 (`ParentBased` + ratio). |
 | `WithServiceName(string)` | `"caerus"` | `service.name` attribute on exported spans. |
-| `WithConfig(ObservabilityConfig)` | — | Loaded config; non-zero fields override the options. |
+| `WithConfig(ObservabilityConfig)` | — | Loaded config overlay. Pointer switches keep construct values when omitted; `trace_insecure` is always copied (false clears `WithTraceInsecure(true)`). |
 | `WithConfigSource(string)` | `""` | Bind a configuration source; `Init` applies its current value and `OnConfigReload` applies later changes live (tracing) or logs restart-required (bind/metrics/health toggles). |
 | `WithLogger(*slog.Logger)` | framework `logs` logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` | Explicit logger override. |
 
 `health_checks`, `metrics` and `tracing` are `*bool` in `ObservabilityConfig`
 so an explicit `false` in the file is honored (turning the feature off) instead
 of being treated as "unset".
+
+`trace_insecure` is a plain `bool`, not a pointer. Overlay **always assigns
+it**. Default and omitted JSON/YAML keys unmarshal as `false`, which means
+**TLS** — and that **clears** a construct `WithTraceInsecure(true)`. Set
+`"trace_insecure": true` in the file (or `OBSERVABILITY_TRACE_INSECURE=true`)
+when the collector has no TLS. This is intentional: we would rather an omitted
+key turn cleartext **off** than leave a construct-time insecure option stuck
+on after a reload.
+
+```text
+Wrong: WithTraceInsecure(true) plus a config file that omits
+       trace_insecure, expecting cleartext OTLP to stay on.
+Right: put "trace_insecure": true in the file if the collector is
+       still cleartext; omit (or false) to force TLS.
+```
 
 ## Component contract
 
