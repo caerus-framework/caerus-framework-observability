@@ -39,5 +39,10 @@ func validateObservabilityConfigValue(v any) error {
 			return err
 		}
 	}
+	if len(cfg.Bind) > 0 {
+		if _, err := parseBindList(cfg.Bind); err != nil {
+			return err
+		}
+	}
 	return nil
 }

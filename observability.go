@@ -57,8 +57,11 @@ type ObservabilityConfig struct {
 	// "otel-collector:4317"). When set and tracing is enabled, spans are
 	// exported to it.
 	TraceEndpoint string `json:"trace_endpoint,omitempty" yaml:"trace_endpoint,omitempty" env:"TRACE_ENDPOINT" flag:"observability-trace-endpoint"`
-	// TraceInsecure admits cleartext OTLP. Default false (TLS). Ops must set
-	// true to talk to a collector without TLS.
+	// TraceInsecure admits cleartext OTLP. This is a plain bool, not *bool:
+	// overlay always copies it, so false (including a JSON/YAML key that was
+	// omitted and unmarshaled as false) turns TLS back on and clears
+	// WithTraceInsecure(true). Default false (TLS). Ops must set true to talk
+	// to a collector without TLS.
 	TraceInsecure bool `json:"trace_insecure,omitempty" yaml:"trace_insecure,omitempty" env:"TRACE_INSECURE" flag:"observability-trace-insecure"`
 	// TraceCAFile is an optional PEM CA file for TLS OTLP (empty = system roots).
 	TraceCAFile string `json:"trace_ca_file,omitempty" yaml:"trace_ca_file,omitempty" env:"TRACE_CA_FILE" flag:"observability-trace-ca-file"`
@@ -109,7 +112,9 @@ func WithTracing(enabled bool) Option {
 	return func(o *options) { o.tracing = enabled }
 }
 
-// WithBind sets one or more host:port listen addresses (default ":9090").
+// WithBind sets one or more host:port listen addresses (default ":9090",
+// all interfaces). Pick an address the scraper can reach; loopback is
+// laptop/sidecar only. Isolation is NetworkPolicy / mesh, not this option.
 func WithBind(addrs ...string) Option {
 	return func(o *options) { o.binds = append([]string{}, addrs...) }
 }
@@ -149,9 +154,9 @@ func WithServiceName(name string) Option {
 	return func(o *options) { o.serviceName = name }
 }
 
-// WithConfig sets the configuration loaded from the configuration component.
-// Non-zero fields of cfg override the values set by the convenience options,
-// which act as in-code defaults:
+// WithConfig overlays cfg onto construct options. Pointer switches
+// (health_checks, metrics, tracing) keep construct values when the pointer is
+// nil. TraceInsecure is always copied: false clears WithTraceInsecure(true).
 //
 //	cfg, _ := cf_configuration.Lookup[cf_observability.ObservabilityConfig](conf, "observability")
 //	o := cf_observability.New(cf_observability.WithConfig(*cfg))
@@ -181,9 +186,10 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(o *options) { o.logger = logger; o.loggerSet = true }
 }
 
-// overlayConfig overlays non-zero fields of cfg onto o. It runs last, so a
-// loaded config always wins over option-set defaults. The *bool fields are
-// pointers so an explicit false in the loaded config is honored.
+// overlayConfig overlays cfg onto o. It runs last, so a loaded config wins
+// over option-set defaults. The *bool switches keep construct values when
+// omitted. TraceInsecure is a plain bool and is always copied: false
+// (including an omitted JSON key) turns TLS back on.
 func overlayConfig(o *options, cfg ObservabilityConfig) {
 	if cfg.HealthChecks != nil {
 		o.healthChecks = *cfg.HealthChecks
@@ -203,9 +209,7 @@ func overlayConfig(o *options, cfg ObservabilityConfig) {
 	if cfg.TraceEndpoint != "" {
 		o.traceEndpoint = cfg.TraceEndpoint
 	}
-	if cfg.TraceInsecure {
-		o.traceInsecure = true
-	}
+	o.traceInsecure = cfg.TraceInsecure
 	if cfg.TraceCAFile != "" {
 		o.traceCAFile = cfg.TraceCAFile
 	}
@@ -356,9 +360,9 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 	// arrive via OnConfigReload.
 	if c.configSource != "" {
 		if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
-		if cfg, err := cf_configuration.Lookup[ObservabilityConfig](conf, c.configSource); err == nil {
-			c.applyConfigLocked(cfg)
-		}
+			if cfg, err := cf_configuration.Lookup[ObservabilityConfig](conf, c.configSource); err == nil {
+				c.applyConfigLocked(cfg)
+			}
 		}
 	}
 
@@ -368,14 +372,14 @@ func (c *Observability) Init(ctx context.Context, fw *cf.CaerusFramework) error 
 		registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		for _, comp := range fw.Components() {
 			if mp, ok := comp.(MetricsProvider); ok {
-				registry.MustRegister(&metricsCollector{name: comp.Name(), provider: mp})
+				registry.MustRegister(&metricsCollector{obs: c, name: comp.Name(), provider: mp})
 			}
 		}
 		if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
-			registry.MustRegister(&logsMetricsCollector{logs: logs})
+			registry.MustRegister(&logsMetricsCollector{obs: c, logs: logs})
 		}
 		if conf, ok := cf.Get[*cf_configuration.Configuration](fw); ok {
-			registry.MustRegister(&configurationMetricsCollector{conf: conf})
+			registry.MustRegister(&configurationMetricsCollector{obs: c, conf: conf})
 		}
 		c.registry = registry
 	}
@@ -534,9 +538,9 @@ func normalizeHTTPServerError(err error) error {
 }
 
 // applyConfigLocked overlays a loaded ObservabilityConfig onto the runtime
-// fields. Non-zero fields win; the *bool fields honor an explicit false.
-// Callers must hold c.mu. Endpoint options that need a bound-server rebuild
-// are not applied live; OnConfigReload logs them as restart-required.
+// fields. Pointer switches honor an explicit false; TraceInsecure is always
+// copied. Callers must hold c.mu. Endpoint options that need a bound-server
+// rebuild are not applied live; OnConfigReload logs them as restart-required.
 func (c *Observability) applyConfigLocked(cfg ObservabilityConfig) {
 	if cfg.HealthChecks != nil {
 		c.healthChecks = *cfg.HealthChecks
@@ -769,6 +773,7 @@ func samplerForRatio(r float64) (trace.Sampler, error) {
 // reads the component's live state, so a component that is not initialized yet
 // returns nil and is skipped — a lazy pickup that needs no subscription.
 type metricsCollector struct {
+	obs      *Observability
 	name     string
 	provider MetricsProvider
 }
@@ -776,10 +781,24 @@ type metricsCollector struct {
 func (mc *metricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (mc *metricsCollector) Collect(ch chan<- prometheus.Metric) {
-	defer recoverCollect(mc.name)
+	log := collectLog(mc.obs)
+	defer recoverCollect(log, mc.name)
 	for _, m := range mc.provider.Metrics() {
-		emitMetric(ch, m)
+		emitMetric(ch, log, m)
 	}
+}
+
+// collectLog returns the component logger without holding it across a scrape.
+func collectLog(c *Observability) *slog.Logger {
+	if c == nil {
+		return slog.Default()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
 }
 
 // livenessHandler reports that the process is alive. Kubernetes uses it for
@@ -798,9 +817,18 @@ func (c *Observability) livenessHandler(w http.ResponseWriter, r *http.Request) 
 // startup probe). Components that do not implement cf.HealthProvider are not
 // included; each included check is bounded by the health-check timeout.
 func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	providers := append([]namedHealth(nil), c.providers...)
+	timeout := c.healthCheckTimeout
+	log := c.logger
+	c.mu.Unlock()
+	if log == nil {
+		log = slog.Default()
+	}
+
 	var failures []string
-	for _, p := range c.providers {
-		checkCtx, cancel := context.WithTimeout(r.Context(), c.healthCheckTimeout)
+	for _, p := range providers {
+		checkCtx, cancel := context.WithTimeout(r.Context(), timeout)
 		err := p.comp.Health(checkCtx)
 		expired := checkCtx.Err() == context.DeadlineExceeded
 		cancel()
@@ -808,10 +836,10 @@ func (c *Observability) readinessHandler(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		if expired {
-			c.logger.Error("cf_observability: health check timed out", "component", p.name)
+			log.Error("cf_observability: health check timed out", "component", p.name)
 			failures = append(failures, fmt.Sprintf("%s: timed_out", p.name))
 		} else {
-			c.logger.Error("cf_observability: health check failed", "component", p.name, "err", err)
+			log.Error("cf_observability: health check failed", "component", p.name, "err", err)
 			failures = append(failures, fmt.Sprintf("%s: %s", p.name, healthReason(err)))
 		}
 	}

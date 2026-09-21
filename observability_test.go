@@ -1,9 +1,11 @@
 package cf_observability
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -227,6 +229,20 @@ func TestConfigOverlay(t *testing.T) {
 	if firstBind(m) != "127.0.0.1:7777" || m.serviceName != "opt" {
 		t.Fatalf("empty config must keep option-set values, got %q %q", firstBind(m), m.serviceName)
 	}
+
+	// trace_insecure is a plain bool: overlay always copies it (false clears).
+	cleared := New(WithTraceInsecure(true), WithConfig(ObservabilityConfig{TraceInsecure: false}))
+	if cleared.traceInsecure {
+		t.Fatal("trace_insecure: false must clear WithTraceInsecure(true)")
+	}
+	kept := New(WithTraceInsecure(true), WithConfig(ObservabilityConfig{TraceInsecure: true}))
+	if !kept.traceInsecure {
+		t.Fatal("trace_insecure: true must keep insecure")
+	}
+	omitted := New(WithTraceInsecure(true), WithConfig(ObservabilityConfig{}))
+	if omitted.traceInsecure {
+		t.Fatal("omitted trace_insecure unmarshals false and must clear construct WithTraceInsecure(true)")
+	}
 }
 
 func TestHealthChecksDisabled(t *testing.T) {
@@ -310,6 +326,43 @@ func TestReadinessTimesOutSlowProviders(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("readiness took %v, want it bounded by the check timeout", elapsed)
 	}
+}
+
+func TestReadinessConcurrentWithShutdown(t *testing.T) {
+	o := New(WithBind("127.0.0.1:0"))
+	ok := &testProvider{name: "ok"}
+	fw := newTestFW(t, o, ok)
+	initFW(t, fw)
+	startHTTP(t, o)
+	url := "http://" + o.Address() + "/readyz"
+	client := &http.Client{Timeout: time.Second}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					resp, err := client.Get(url)
+					if err == nil {
+						_, _ = io.Copy(io.Discard, resp.Body)
+						_ = resp.Body.Close()
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := o.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func TestShutdownStopsServer(t *testing.T) {
@@ -405,6 +458,31 @@ func TestMetricsEndpointLazyPickup(t *testing.T) {
 	}
 	if !strings.Contains(body, `app_info{mode="prod"} 1`) {
 		t.Fatalf("/metrics after pickup body missing the app_info sample:\n%s", body)
+	}
+}
+
+type panicMetrics struct{ *plainComp }
+
+func (p *panicMetrics) Metrics() []Metric { panic("metric-boom") }
+
+func TestRecoverCollectUsesComponentLogger(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	o := New(WithBind("127.0.0.1:0"), WithLogger(log))
+	fw := newTestFW(t, o, &panicMetrics{plainComp: &plainComp{name: "boom"}})
+	initFW(t, fw)
+	startHTTP(t, o)
+
+	code, _ := get(t, "http://"+o.Address()+"/metrics")
+	if code != http.StatusOK {
+		t.Fatalf("/metrics with panicking collector = %d, want 200", code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "skipped bad metric sample") {
+		t.Fatalf("component logger missed panic recovery: %s", out)
+	}
+	if !strings.Contains(out, "boom") {
+		t.Fatalf("collector name missing from recovery log: %s", out)
 	}
 }
 

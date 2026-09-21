@@ -67,13 +67,15 @@ type MetricsProvider interface {
 // Bootstrap components cannot implement MetricsProvider (import cycle), so
 // observability reads their state directly.
 type logsMetricsCollector struct {
+	obs  *Observability
 	logs *cf_logs.Logs
 }
 
 func (c *logsMetricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
-	defer recoverCollect("logs")
+	log := collectLog(c.obs)
+	defer recoverCollect(log, "logs")
 	ms := []Metric{{
 		Name:  "logs_info",
 		Help:  "Current logging configuration.",
@@ -98,7 +100,7 @@ func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 		})
 	}
 	for _, m := range ms {
-		emitMetric(ch, m)
+		emitMetric(ch, log, m)
 	}
 }
 
@@ -106,15 +108,17 @@ func (c *logsMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 // for /metrics. Bootstrap components cannot implement MetricsProvider (import
 // cycle), so observability reads their state directly.
 type configurationMetricsCollector struct {
+	obs  *Observability
 	conf *cf_configuration.Configuration
 }
 
 func (c *configurationMetricsCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
-	defer recoverCollect("configuration")
+	log := collectLog(c.obs)
+	defer recoverCollect(log, "configuration")
 	for _, sample := range c.conf.MetricSamples() {
-		emitMetric(ch, Metric{
+		emitMetric(ch, log, Metric{
 			Name:   sample.Name,
 			Help:   sample.Help,
 			Value:  sample.Value,
@@ -123,11 +127,11 @@ func (c *configurationMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func emitMetric(ch chan<- prometheus.Metric, m Metric) {
+func emitMetric(ch chan<- prometheus.Metric, log *slog.Logger, m Metric) {
 	if m.Name == "" {
 		return
 	}
-	defer recoverCollect(m.Name)
+	defer recoverCollect(log, m.Name)
 	labelNames := make([]string, 0, len(m.Labels))
 	for name := range m.Labels {
 		labelNames = append(labelNames, name)
@@ -145,9 +149,12 @@ func emitMetric(ch chan<- prometheus.Metric, m Metric) {
 	ch <- prometheus.MustNewConstMetric(desc, vt, m.Value, labelValues...)
 }
 
-func recoverCollect(name string) {
+func recoverCollect(log *slog.Logger, name string) {
 	if rec := recover(); rec != nil {
-		slog.Error("cf_observability: skipped bad metric sample", "collector", name, "panic", rec)
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Error("cf_observability: skipped bad metric sample", "collector", name, "panic", rec)
 	}
 }
 
